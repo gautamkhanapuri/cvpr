@@ -1,0 +1,19 @@
+# Specific to CVPR dir
+*.onnx
+proj_2/image_database/
+**env/
+**.idea/
+proj_2/cbir_test/
+proj_2/test_images/
+
+
+#Executables
+#PROJ 1
+proj_1/image_filter
+proj_1/task1
+proj_1/task2
+proj_1/timer
+
+# PROJECT 2
+proj_2/p1
+proj_2/p2
