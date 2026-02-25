@@ -58,13 +58,13 @@ int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
         mean2 = new_mean2;
         // std::cout << cluster1_count << " " << cluster2_count << std::endl;
         if (m1_stop && m2_stop) {
-            std::cout << "Kmeans converged in " << i << " iterations" << std::endl;
+            // std::cout << "Kmeans converged in " << i << " iterations" << std::endl;
             break;
         }
     }
 
-    std::cout << "FG Center: (" << (int)mean1[0] << ", " << (int)mean1[1] << ", " << (int)mean1[2] << ")" << std::endl;
-    std::cout << "BG Center: (" << (int)mean2[0] << ", " << (int)mean2[1] << ", " << (int)mean2[2] << ")" << std::endl;
+    // std::cout << "FG Center: (" << (int)mean1[0] << ", " << (int)mean1[1] << ", " << (int)mean1[2] << ")" << std::endl;
+    // std::cout << "BG Center: (" << (int)mean2[0] << ", " << (int)mean2[1] << ", " << (int)mean2[2] << ")" << std::endl;
 
     dst.create(src.rows, src.cols, CV_8UC1);
     for (int i = 0; i < src.rows; i++) {
@@ -91,56 +91,22 @@ int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
 }
 
 int Threshold::white_screen_threshold(cv::Mat &src, cv::Mat &dst) {
-    dst.create(src.rows, src.cols, CV_8UC1);
-    for (int i = 0; i < src.rows; i++) {
-        cv::Vec3b* ptr = src.ptr<cv::Vec3b>(i);
-        uchar* dst_ptr = dst.ptr<uchar>(i);
-        for (int j = 0; j < src.cols; j++) {
-            long dist_from_white = (this->bg_white[0] - ptr[j][0]) * (this->bg_white[0] - ptr[j][0]) + (this->bg_white[1] - ptr[j][1]) * (this->bg_white[1] - ptr[j][1]) + (this->bg_white[2] - ptr[j][2]) * (this->bg_white[2] - ptr[j][2]);
-            if (dist_from_white >= sq_diff_with_white) {
-                dst_ptr[j] = 255;
-            } else {
-                dst_ptr[j] = 0;
-            }
-        }
-    }
+    cv::Mat diff;
+    cv::absdiff(src, dst, diff);
+    cv::Mat grey_diff;
+    cv::cvtColor(diff, grey_diff, cv::COLOR_GRAY2BGR);
+    cv::threshold(grey_diff, dst, 10, 255, cv::THRESH_BINARY);
     return 0;
 }
 
-bool Threshold::pickup_white_screen(cv::Mat &src) {
-    float b = 0.0;
-    float g = 0.0;
-    float r = 0.0;
-    int count = 0;
-
-    for (int i = 0; i < src.rows; i+=10) {
-        cv::Vec3b* ptr = src.ptr<cv::Vec3b>(i);
-        for (int j = 0; j < src.cols; j+=10) {
-            b += ptr[j][0];
-            g += ptr[j][1];
-            r += ptr[j][2];
-            count++;
-        }
-    }
-    b /= count;
-    g /= count;
-    r /= count;
-
-    bool high_enough = (b >=white_highness) && (g >=white_highness) && (r >=white_highness);
-    float max_diff = std::max({std::abs(b-g), std::abs(r-g), std::abs(b-r)});
-    bool close_enough = (max_diff <= white_closeness);
-    if (high_enough && close_enough) {
-        auto b_ = static_cast<uchar>(b);
-        auto g_ = static_cast<uchar>(g);
-        auto r_ = static_cast<uchar>(r);
-        this->bg_white = cv::Vec3b(b_, g_, r_);
-        return true;
-    }
-    return false;
+bool Threshold::pickup_white_screen(const cv::Mat &src) {
+    cv::blur(src, this->bg, cv::Size(gaussian_blur_kernel_size, gaussian_blur_kernel_size));
+    return true;
 }
 
 int Threshold::threshold(cv::Mat &src, cv::Mat &dst) {
-    cv::blur(src, src, cv::Size(blurring_kernel_size, blurring_kernel_size));
+    // cv::Mat tmp_blur;
+    // cv::blur(src, tmp_blur, cv::Size(blurring_kernel_size, blurring_kernel_size));
     std::map<int, ThresholdCallback>::const_iterator it = this->callbacks.find(this->mode);
     if (it == this->callbacks.end()) {
         return dynamic_threshold(src, dst);

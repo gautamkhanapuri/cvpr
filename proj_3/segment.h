@@ -11,7 +11,7 @@
 #include <cmath>
 #include <iostream>
 
-inline const int min_area_pix = 9000;
+inline const int min_area_pix = 4000;
 inline const float acceptable_centroid_x_ch = 5.0;
 inline const float acceptable_centroid_y_ch = 5.0;
 inline const float acceptable_box_width_ch  = 5.0;

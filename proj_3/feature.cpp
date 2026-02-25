@@ -202,6 +202,8 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
 }
 
 int Classifier::predict(std::vector<RegionStats> &regions) {
+    // std::cout << "Entered predicting mode." << std::endl;
+    // std::cout << regions.size() << " regions." << std::endl;
     for (RegionStats &r : regions) {
         float min_dist = std::numeric_limits<float>::max();
         std::string min_label = unknown;
@@ -222,6 +224,8 @@ int Classifier::predict(std::vector<RegionStats> &regions) {
             }
         }
         if (min_dist < label_matching_threshold) {
+            // std::cout << min_label << std::endl;
+            // std::cout << min_dist << std::endl;
             r.label = min_label;
         } else {
             r.label = unknown;
@@ -232,5 +236,8 @@ int Classifier::predict(std::vector<RegionStats> &regions) {
 }
 
 bool Classifier::has_training_data() const {
+    // std::cout << "Classifier::has_training_data()" << std::endl;
+    // std::cout << "Labels: " << this->labels.size() << std::endl;
+    // std::cout << "Features: " << this->features.size() << std::endl;
     return this->features.empty();
 }

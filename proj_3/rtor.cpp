@@ -13,6 +13,7 @@ RTObectRecognizer::RTObectRecognizer(const fs::path& db_filepath): db_filepath(d
     this->api_id = cv::CAP_AVFOUNDATION;
     this->show_binary = false;
     this->show_morphology = false;
+    this->white_screen_set = false;
 
     vid_setup();
 }
@@ -76,7 +77,7 @@ int RTObectRecognizer::run() {
         this->segment.make_segments(this->morph_frame, this->label_map, region_stats);
         this->feature.calculate_basic_2d_features(region_stats);
 
-        if (this->classifier.has_training_data()) {
+        if (!this->classifier.has_training_data()) {
             this->classifier.predict(region_stats);
         }
 
