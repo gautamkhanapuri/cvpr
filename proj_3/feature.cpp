@@ -158,7 +158,7 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
             int retry_count = 3;
             std::string user_input_label;
             std::cout << "Available labels:" << std::endl;
-            int idx = 0;
+            int idx = 1;
             for (const std::string& label : this->labels_set) {
                 std::cout << idx << ". " << label << std::endl;
                 idx++;
@@ -175,7 +175,7 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
                 }
                 std::cout << "Invalid label entered." << std::endl;
                 std::cout << "Remaining retries = " << retry_count << ". Try again. Copy paste the correct label in lower case." << std::endl;
-                int idx1 = 0;
+                int idx1 = 1;
                 for (const std::string& label : this->labels_set) {
                     std::cout << idx1 << ". " << label << std::endl;
                     idx1++;

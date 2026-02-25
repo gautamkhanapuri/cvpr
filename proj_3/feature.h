@@ -19,9 +19,9 @@
 
 namespace fs = std::filesystem;
 
-inline const std::string training_img_display_window_name = "Training Image Display";
+inline const std::string training_img_display_window_name = "Training Image Display. 'p' - skip region / 'a' - add label";
 inline const int num_features = 7;
-inline const float label_matching_threshold = 2.0;
+inline const float label_matching_threshold = 1.75;
 inline const std::string unknown = "Unknown";
 
 class Feature {

@@ -92,22 +92,30 @@ int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
 
 int Threshold::white_screen_threshold(cv::Mat &src, cv::Mat &dst) {
     cv::Mat diff;
-    cv::absdiff(src, dst, diff);
+    cv::absdiff(this->bg, src, diff);
     cv::Mat grey_diff;
-    cv::cvtColor(diff, grey_diff, cv::COLOR_GRAY2BGR);
+    cv::cvtColor(diff, grey_diff, cv::COLOR_RGB2GRAY);
     cv::threshold(grey_diff, dst, 10, 255, cv::THRESH_BINARY);
     return 0;
 }
 
 bool Threshold::pickup_white_screen(const cv::Mat &src) {
     cv::blur(src, this->bg, cv::Size(gaussian_blur_kernel_size, gaussian_blur_kernel_size));
-    return true;
+    std::cout << "Are you satisfied with this white screen? <y/n>" << std::endl;
+    cv::imshow(bg_display_window_title, this->bg);
+    int k = cv::waitKey(0);
+    cv::destroyWindow(bg_display_window_title);
+    if (k == 'y') {
+        return true;
+    } else {
+        return false;
+    }
 }
 
-int Threshold::threshold(cv::Mat &src, cv::Mat &dst) {
+int Threshold::threshold(cv::Mat &src, cv::Mat &dst, const int mode) {
     // cv::Mat tmp_blur;
     // cv::blur(src, tmp_blur, cv::Size(blurring_kernel_size, blurring_kernel_size));
-    std::map<int, ThresholdCallback>::const_iterator it = this->callbacks.find(this->mode);
+    std::map<int, ThresholdCallback>::const_iterator it = this->callbacks.find(mode);
     if (it == this->callbacks.end()) {
         return dynamic_threshold(src, dst);
     }

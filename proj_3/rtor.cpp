@@ -6,11 +6,12 @@
 
 #include "utils.h"
 
-RTObectRecognizer::RTObectRecognizer(const fs::path& db_filepath): db_filepath(db_filepath), threshold(threshold_mode), classifier(db_filepath) {
+RTObectRecognizer::RTObectRecognizer(const fs::path& db_filepath): db_filepath(db_filepath), classifier(db_filepath) {
     std::cout << "Initialised RTObectRecognizer..." << std::endl;
     this->vd_cap = nullptr;
     this->device_id = 0;
     this->api_id = cv::CAP_AVFOUNDATION;
+    this->threshold_mode = starter_threshold_mode;
     this->show_binary = false;
     this->show_morphology = false;
     this->white_screen_set = false;
@@ -45,6 +46,7 @@ int RTObectRecognizer::vid_setup() {
 
 int RTObectRecognizer::run() {
     cv::namedWindow(window1, 1);
+    std::cout << "Using Thresholding mode: " << this->threshold_mode << std::endl;
     std::cout << "Displaying Real Time video now..." << std::endl;
 
     for (;;) {
@@ -56,21 +58,21 @@ int RTObectRecognizer::run() {
         }
         // cv::imwrite("test.jpg", main_frame);
 
-        if (threshold_mode == 1  && !this->white_screen_set) {
+        if (this->threshold_mode == 1  && !this->white_screen_set) {
             std::cout << "Reading white screen. Ensure platform is empty with only white background." << std::endl;
             std::cout << "White screen can be reset later by pressing the key 'w'. " << std::endl;
             bool white_screen_is_clean = this->threshold.pickup_white_screen(this->main_frame);
             if (!white_screen_is_clean) {
-                std::cout << "White screen not picked up. Clean WS." << std::endl;
-                cv::imshow(window1, this->main_frame);
-                this->pressed = cv::waitKey(10);
+                std::cout << "White screen not picked up. Clean up the whitescreen." << std::endl;
+                // cv::imshow(window1, this->main_frame);
+                // this->pressed = cv::waitKey(10);
                 continue;
             }
             this->white_screen_set = true;
             std::cout << "White screen captured! Starting object recognition..." << std::endl;
         }
 
-        this->threshold.threshold(this->main_frame, this->bin_frame);
+        this->threshold.threshold(this->main_frame, this->bin_frame, this->threshold_mode);
         morph(this->bin_frame, this->morph_frame);
 
         std::vector<RegionStats>  region_stats;
@@ -152,6 +154,16 @@ int RTObectRecognizer::handle_key(int key, std::vector<RegionStats> &regions) {
 
             break;
         }
+
+        case '0':
+            std::cout << "Changing threshold mode to 0 - Dynamic thresholding." << std::endl;
+            this->threshold_mode = 0;
+            break;
+
+        case '1':
+            std::cout << "Changing threshold mode to 1 - Background subtraction thresholding." << std::endl;
+            this->threshold_mode = 1;
+            break;
 
         default: ;
     }

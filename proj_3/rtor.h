@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 inline const std::string window1 = "Primary Window-Real Time Object Recognition";
 inline const std::string threshold_binary_window = "Thresholding-Binary Image";
 inline const std::string cleaned_morph_window = "Morphology-Cleaned up image";
-inline const int threshold_mode = 1;
+inline const int starter_threshold_mode = 0;
 inline const std::string main_image_filename = "original_";
 inline const std::string overlay_image_filename = "overlayed_";
 inline const std::string threshold_image_filename = "threshold_";
@@ -39,6 +39,8 @@ class RTObectRecognizer {
     int api_id;
     cv::Size refS;
     int pressed;
+
+    int threshold_mode;
 
     bool show_binary;
     bool show_morphology;
