@@ -6,7 +6,7 @@ CPPFLAGS := -I/opt/homebrew/include/opencv4 -I/opt/homebrew/include/onnxruntime
 VERSION := 20
 CXXFLAGS := -Wall -std=c++$(VERSION)
 LDFLAGS := -L/opt/homebrew/lib/opencv4/3rdparty -L/opt/homebrew/lib
-LDLIBS := -ltiff -lpng -ljpeg -llapack -lblas -lz -lwebp -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreServices -framework CoreGraphics -framework AppKit -framework OpenCL  -lopencv_core -lopencv_highgui -lopencv_video -lopencv_videoio -lopencv_imgcodecs -lopencv_imgproc -lopencv_objdetect -lonnxruntime
+LDLIBS := -ltiff -lpng -ljpeg -llapack -lblas -lz -lwebp -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreServices -framework CoreGraphics -framework AppKit -framework OpenCL  -lopencv_core -lopencv_highgui -lopencv_video -lopencv_videoio -lopencv_imgcodecs -lopencv_imgproc -lopencv_objdetect -lonnxruntime -lopencv_dnn
 
 TARGET := rtor
 HDRS := $(wildcard *.h) $(wildcard *.hpp)
@@ -25,7 +25,7 @@ debug: $(TARGET)
 #$(OBJS): $(HDRS) $(SRCS)
 #	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c $(SRCS)
 
-rtor: main.o rtor.o threshold.o morph.o segment.o feature.o csv_util.o utils.o
+rtor: main.o rtor.o threshold.o morph.o segment.o feature.o csv_util.o utils.o resnetclassifier.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 #p1: p1.o csv_util.o mycv_utils.o utils.o

@@ -6,24 +6,33 @@
 
 #include "utils.h"
 
-RTObectRecognizer::RTObectRecognizer(const fs::path& db_filepath): db_filepath(db_filepath), classifier(db_filepath) {
+RTObectRecognizer::RTObectRecognizer(const fs::path &db_filepath,
+                                     const fs::path &dnn_db_filepath): db_filepath(db_filepath),
+                                                                       classifier(db_filepath) {
     std::cout << "Initialised RTObectRecognizer..." << std::endl;
     this->vd_cap = nullptr;
+    this->resnet = nullptr;
     this->device_id = 0;
     this->api_id = cv::CAP_AVFOUNDATION;
     this->threshold_mode = starter_threshold_mode;
     this->show_binary = false;
     this->show_morphology = false;
     this->white_screen_set = false;
+    this->dnn_db_filepath = dnn_db_filepath;
+    this->resnet_available = false;
+    this->classify_with_resnet = false;
 
     vid_setup();
+    resnet_setup();
 }
 
 RTObectRecognizer::~RTObectRecognizer() {
     std::cout << "Destroying RTObectRecognizer..." << std::endl;
     delete this->vd_cap;
     this->classifier.write_new_trained_data();
-    std::cout << "All new data trained in this session appended to the same file: " << fs::absolute(this->db_filepath) << std::endl;
+    std::cout << "All new data trained in this session appended to the same file: " << fs::absolute(this->db_filepath)
+            << std::endl;
+    delete this->resnet;
 }
 
 int RTObectRecognizer::vid_setup() {
@@ -39,8 +48,30 @@ int RTObectRecognizer::vid_setup() {
         std::exit(-1);
     }
 
-    this->refS = cv::Size(static_cast<int>(this->vd_cap->get(cv::CAP_PROP_FRAME_WIDTH)), static_cast<int>(this->vd_cap->get(cv::CAP_PROP_FRAME_HEIGHT)));
+    this->refS = cv::Size(static_cast<int>(this->vd_cap->get(cv::CAP_PROP_FRAME_WIDTH)),
+                          static_cast<int>(this->vd_cap->get(cv::CAP_PROP_FRAME_HEIGHT)));
     std::cout << "Video Display Initialized.\nWidth: " << refS.width << "\nHeight: " << refS.height << std::endl;
+    return 0;
+}
+
+int RTObectRecognizer::resnet_setup() {
+    std::cout << "Starting resnet..." << std::endl;
+    this->resnet = new ResNetClassifier(this->dnn_db_filepath);
+    this->resnet_available = this->resnet->load_resenet18();
+    if (this->resnet_available) {
+        std::cout << "Successfully loaded resnet." << std::endl;
+        if (!this->resnet->has_training_data()) {
+            std::cout <<
+                    "You need to first train the model on your images by pressing 'N' and then annotating the regions with the correct labels."
+                    << std::endl;
+            std::cout << "Prediction by resnet will be available when it has been trained on atleast one datapoint." <<
+                    std::endl;
+        }
+        std::cout << "Press 'r' to toggle using the dnn labelling." << std::endl;
+    } else {
+        std::cout << "Unable to load resnet." << std::endl;
+        std::cout << "Resnet predictions will not available" << std::endl;
+    }
     return 0;
 }
 
@@ -56,9 +87,8 @@ int RTObectRecognizer::run() {
             std::cerr << "Terminating..." << std::endl;
             std::exit(-1);
         }
-        // cv::imwrite("test.jpg", main_frame);
 
-        if (this->threshold_mode == 1  && !this->white_screen_set) {
+        if (this->threshold_mode == 1 && !this->white_screen_set) {
             std::cout << "Reading white screen. Ensure platform is empty with only white background." << std::endl;
             std::cout << "White screen can be reset later by pressing the key 'w'. " << std::endl;
             bool white_screen_is_clean = this->threshold.pickup_white_screen(this->main_frame);
@@ -75,12 +105,16 @@ int RTObectRecognizer::run() {
         this->threshold.threshold(this->main_frame, this->bin_frame, this->threshold_mode);
         morph(this->bin_frame, this->morph_frame);
 
-        std::vector<RegionStats>  region_stats;
+        std::vector<RegionStats> region_stats;
         this->segment.make_segments(this->morph_frame, this->label_map, region_stats);
         this->feature.calculate_basic_2d_features(region_stats);
 
-        if (!this->classifier.has_training_data()) {
+        if (this->classifier.has_training_data()) {
             this->classifier.predict(region_stats);
+        }
+
+        if (this->resnet_available && this->classify_with_resnet) {
+            this->resnet->classify(this->main_frame, region_stats);
         }
 
         this->display_frame = this->main_frame.clone();
@@ -88,15 +122,12 @@ int RTObectRecognizer::run() {
         this->feature.overlay_features(this->display_frame, region_stats);
 
         cv::imshow(window1, this->display_frame);
-
         if (show_binary) {
             cv::imshow(threshold_binary_window, this->bin_frame);
         }
-
         if (show_morphology) {
             cv::imshow(cleaned_morph_window, this->morph_frame);
         }
-
         this->pressed = cv::waitKey(10);
         this->handle_key(this->pressed, region_stats);
 
@@ -105,38 +136,69 @@ int RTObectRecognizer::run() {
             break;
         }
     }
-
     cv::destroyAllWindows();
     return 0;
 }
 
 int RTObectRecognizer::handle_key(int key, std::vector<RegionStats> &regions) {
     switch (key) {
-        case 'n':
+        case 'r': // Will enable predictions by the model in addition to normal predictions
+            if (this->resnet_available) {
+                if (this->resnet->has_training_data()) {
+                    this->classify_with_resnet = !this->classify_with_resnet;
+                    std::cout << "In addition to classic features, resnet will be used to predict labels separately." <<
+                            std::endl;
+                } else {
+                    std::cout << "Resnet model has not been trained on your images." << std::endl;
+                    std::cout <<
+                            "Inorder to get predictions on your data, please train first by pressing 'N' and annotating the regions with correct labels."
+                            << std::endl;
+                    std::cout << "Only then will prediction using resnet be available!" << std::endl;
+                }
+            } else {
+                std::cout << "Resnet is not available!! Unable to load model." << std::endl;
+            }
+            break;
+
+        case 'N': // Train the model on the regions available in the frame.
+            if (this->resnet_available) {
+                std::cout << "key handling " << std::endl;
+                // std::cout << "  Extents in train(): minE1=" << regions[0].axisExtent.minE1
+                //           << " maxE1=" << regions[0].axisExtent.maxE1
+                //           << " minE2=" << regions[0].axisExtent.minE2
+                //           << " maxE2=" << regions[0].axisExtent.maxE2 << std::endl;
+                this->resnet->train(this->main_frame, regions);
+            } else {
+                std::cout << "Resnet is not available!! Unable to load model." << std::endl;
+            }
+            break;
+
+        case 'n': // Train the classic classifier on the regions available in the frame.
             this->classifier.train_on_all_segments(this->main_frame, this->label_map, regions);
             break;
 
-        case 't':
+        case 't': // Shows binary image in addition to main display
             this->show_binary = !this->show_binary;
             if (!this->show_binary) {
                 cv::destroyWindow(threshold_binary_window);
             }
             break;
 
-        case 'm':
+        case 'm': // Shows morphed image in addition to main display
             this->show_morphology = !this->show_morphology;
             if (!this->show_morphology) {
                 cv::destroyWindow(cleaned_morph_window);
             }
             break;
 
-        case 'w':
+        case 'w': // Capture background for thresholding
             if (threshold_mode == 1) {
                 this->white_screen_set = false;
             }
             break;
 
         case 's': {
+            // Save all the frames as png
             const long long time_now = get_time_instant();
             const std::string time_now_str = std::to_string(time_now);
 
@@ -155,12 +217,12 @@ int RTObectRecognizer::handle_key(int key, std::vector<RegionStats> &regions) {
             break;
         }
 
-        case '0':
+        case '0': // Change thresholding to dynamic thresholding mode.
             std::cout << "Changing threshold mode to 0 - Dynamic thresholding." << std::endl;
             this->threshold_mode = 0;
             break;
 
-        case '1':
+        case '1': // Change thresholding to subtraction thresholding mode.
             std::cout << "Changing threshold mode to 1 - Background subtraction thresholding." << std::endl;
             this->threshold_mode = 1;
             break;
@@ -169,5 +231,3 @@ int RTObectRecognizer::handle_key(int key, std::vector<RegionStats> &regions) {
     }
     return 0;
 }
-
-

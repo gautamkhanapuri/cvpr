@@ -4,7 +4,7 @@
 
 #include "morph.h"
 
-int morph(const cv::Mat& src, cv::Mat& dst) {
+int morph(const cv::Mat &src, cv::Mat &dst) {
     // std::cout << "Start morph" << std::endl;
     // std::cout << "src type: " << src.type() << std::endl;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kernel_size, kernel_size));

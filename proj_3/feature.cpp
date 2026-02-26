@@ -4,12 +4,15 @@
 
 #include "feature.h"
 
-int Feature::calculate_basic_2d_features(std::vector<RegionStats>& regions) {
+int Feature::calculate_basic_2d_features(std::vector<RegionStats> &regions) {
     // std::cout << "Entered calculate_basic_2d_features" << std::endl;
     // std::cout << "Detected regions (after ignoring small regions below threshold) = " << regions.size() << std::endl;
-    for (RegionStats& r : regions) {
+    for (RegionStats &r: regions) {
         // Percent filled
-        float percent_filled = r.moments.m00 / r.oriented_box.size.width * r.oriented_box.size.height;
+        // float percent_filled = r.moments.m00 / r.oriented_box.size.width * r.oriented_box.size.height;
+        // Correct percentage is actually calculated like this:
+        float percent_filled = r.moments.m00 / (r.oriented_box.size.width * r.oriented_box.size.height);
+        // I have retained it like this for now because I had already trained data using the incorrect formula which too is invariant
         float ar = r.oriented_box.size.height / r.oriented_box.size.width;
         float compactness = 0.0;
         float circularity = 0.0;
@@ -26,7 +29,10 @@ int Feature::calculate_basic_2d_features(std::vector<RegionStats>& regions) {
         double hu2 = std::log(std::abs(hu[2]));
 
         r.features.clear();
-        r.features = {percent_filled, ar, compactness, circularity, static_cast<float>(hu0), static_cast<float>(hu1), static_cast<float>(hu2)};
+        r.features = {
+            percent_filled, ar, compactness, circularity, static_cast<float>(hu0), static_cast<float>(hu1),
+            static_cast<float>(hu2)
+        };
     }
     // std::cout << "Completed calculate_basic_2d_features" << std::endl;
     return 0;
@@ -34,9 +40,22 @@ int Feature::calculate_basic_2d_features(std::vector<RegionStats>& regions) {
 
 int Feature::overlay_features(cv::Mat &src, std::vector<RegionStats> &regions) {
     int count = 20;
-    for (RegionStats& r : regions) {
+    for (RegionStats &r: regions) {
         std::string lab = r.label.empty() ? "Unknown" : r.label;
-        std::string str = std::format("Label: {} | Features: PF = {:0.2f} | AR = {:0.2f} | CO = {:0.2f} | CR = {:0.2f} | HU1 = {:0.2f} | HU2 = {:0.2f} | HU3 = {:0.2f} | ANGLE = {:0.2f}", lab, r.features[0], r.features[1], r.features[2], r.features[3], r.features[4], r.features[5], r.features[6], r.angle);
+        float display_angle_degrees = r.angle * 180.0f / CV_PI;
+        std::string str;
+        if (r.dnn_label.empty()) {
+            str = std::format(
+                "Label: {}|Features:PF={:0.2f}|AR={:0.2f}|CO={:0.2f}|CR={:0.2f}|HU1={:0.2f}|HU2={:0.2f}|HU3={:0.2f}|ANGLE={:0.2f}",
+                lab, r.features[0], r.features[1], r.features[2], r.features[3], r.features[4], r.features[5],
+                r.features[6], display_angle_degrees);
+        } else {
+            str = std::format(
+                "DNN: {} | Label: {}| [{:0.2f} , {:0.2f} , {:0.2f} , {:0.2f} , {:0.2f} , {:0.2f} , {:0.2f}] |ANGLE={:0.2f}",
+                r.dnn_label, lab, r.features[0], r.features[1], r.features[2], r.features[3], r.features[4],
+                r.features[5], r.features[6], display_angle_degrees);
+        }
+        // std::cout << str << std::endl;
         cv::Point p(10, count);
         cv::putText(src, str, p, cv::QT_FONT_NORMAL, 0.6, r.color, 1);
         count += 20;
@@ -45,7 +64,7 @@ int Feature::overlay_features(cv::Mat &src, std::vector<RegionStats> &regions) {
 }
 
 int Classifier::load_db_file() {
-    std::vector<char*> temp_labels;
+    std::vector<char *> temp_labels;
     read_image_data_csv(this->db_path.string().c_str(), temp_labels, this->features);
     for (int i = 0; i < temp_labels.size(); i++) {
         this->labels.push_back(temp_labels[i]);
@@ -72,8 +91,8 @@ int Classifier::recalculate_average() {
         return 0;
     }
     this->average.assign(num_features, 0.0);
-    for (const std::vector<float>& feature_vec : this->features) {
-        for (int i = 0; i <num_features; i++) {
+    for (const std::vector<float> &feature_vec: this->features) {
+        for (int i = 0; i < num_features; i++) {
             this->average[i] += feature_vec[i];
         }
     }
@@ -92,8 +111,8 @@ int Classifier::recalculate_stddev() {
     }
     this->stddev.assign(num_features, 0.0);
 
-    for (const std::vector<float>& feature_vec : this->features) {
-        for (int i = 0; i <num_features; i++) {
+    for (const std::vector<float> &feature_vec: this->features) {
+        for (int i = 0; i < num_features; i++) {
             double diff = feature_vec[i] - this->average[i];
             this->stddev[i] += diff * diff;
         }
@@ -136,17 +155,20 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
     size_t number_of_regions = regions.size();
     std::cout << "Detected " << number_of_regions << " regions." << std::endl;
     std::cout << "Please enter the correct label for the displayed region in lower case." << std::endl;
-    std::cout << "The region will be displayed to you. Press 'a' to be able to enter the label in the teminal or press 'p' to skip the region." << std::endl;
+    std::cout <<
+            "The region will be displayed to you. Press 'a' to be able to enter the label in the teminal or press 'p' to skip the region."
+            << std::endl;
     std::cout << "If you press 'a', type into the terminal." << std::endl;
 
     int counter = 1;
-    for (RegionStats& r : regions) {
+    for (RegionStats &r: regions) {
         cv::Mat mask = (label_map == r.region_id);
         cv::Rect roi = cv::boundingRect(mask);
         cv::Mat display_mat;
         orig_img.copyTo(display_mat, mask);
         display_mat = display_mat(roi).clone();
-        std::string title = training_img_display_window_name + " - Region " + std::to_string(counter) + " out of " + std::to_string(number_of_regions);
+        std::string title = training_img_display_window_name + " - Region " + std::to_string(counter) + " out of " +
+                            std::to_string(number_of_regions);
         cv::imshow(training_img_display_window_name, display_mat);
         cv::setWindowTitle(training_img_display_window_name, title);
         int key = cv::waitKey(0);
@@ -159,7 +181,7 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
             std::string user_input_label;
             std::cout << "Available labels:" << std::endl;
             int idx = 1;
-            for (const std::string& label : this->labels_set) {
+            for (const std::string &label: this->labels_set) {
                 std::cout << idx << ". " << label << std::endl;
                 idx++;
             }
@@ -174,9 +196,10 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
                     break;
                 }
                 std::cout << "Invalid label entered." << std::endl;
-                std::cout << "Remaining retries = " << retry_count << ". Try again. Copy paste the correct label in lower case." << std::endl;
+                std::cout << "Remaining retries = " << retry_count <<
+                        ". Try again. Copy paste the correct label in lower case." << std::endl;
                 int idx1 = 1;
-                for (const std::string& label : this->labels_set) {
+                for (const std::string &label: this->labels_set) {
                     std::cout << idx1 << ". " << label << std::endl;
                     idx1++;
                 }
@@ -204,15 +227,15 @@ int Classifier::train_on_all_segments(cv::Mat &orig_img, cv::Mat &label_map, std
 int Classifier::predict(std::vector<RegionStats> &regions) {
     // std::cout << "Entered predicting mode." << std::endl;
     // std::cout << regions.size() << " regions." << std::endl;
-    for (RegionStats &r : regions) {
+    for (RegionStats &r: regions) {
         float min_dist = std::numeric_limits<float>::max();
         std::string min_label = unknown;
         std::vector<float> this_region_features = r.features;
-        for (int i=0; i < this->features.size(); i++) {
+        for (int i = 0; i < this->features.size(); i++) {
             float dist_sum = 0.0;
             std::string this_label = this->labels[i];
             std::vector<float> this_features = this->features[i];
-            for (int j=0; j < num_features; j++) {
+            for (int j = 0; j < num_features; j++) {
                 double diff = this_features[j] - this_region_features[j];
                 double scaled_diff = diff / this->stddev[j];
                 dist_sum += scaled_diff * scaled_diff;
@@ -239,5 +262,5 @@ bool Classifier::has_training_data() const {
     // std::cout << "Classifier::has_training_data()" << std::endl;
     // std::cout << "Labels: " << this->labels.size() << std::endl;
     // std::cout << "Features: " << this->features.size() << std::endl;
-    return this->features.empty();
+    return !this->features.empty();
 }

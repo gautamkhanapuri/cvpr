@@ -6,16 +6,16 @@
 
 int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
     std::vector<cv::Vec3b> pixels;
-    for (int i = 0; i < src.rows; i+=4) {
-        cv::Vec3b* ptr = src.ptr<cv::Vec3b>(i);
-        for (int j = 0; j < src.cols; j+=4) {
+    for (int i = 0; i < src.rows; i += 4) {
+        cv::Vec3b *ptr = src.ptr<cv::Vec3b>(i);
+        for (int j = 0; j < src.cols; j += 4) {
             pixels.push_back(ptr[j]);
         }
     }
 
     // K means
-    cv::Vec3b mean1(0, 0, 0);  // Center of fg
-    cv::Vec3b mean2(255, 255, 255);  // Center of bg
+    cv::Vec3b mean1(0, 0, 0); // Center of fg
+    cv::Vec3b mean2(255, 255, 255); // Center of bg
 
     for (int i = 0; i < kmeans_max_iter; i++) {
         float cluster1_b = 0.0, cluster2_b = 0.0;
@@ -24,9 +24,11 @@ int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
         int cluster1_count = 0;
         int cluster2_count = 0;
 
-        for (cv::Vec3b& pt : pixels) {
-            long dist_from_mean1 = (mean1[0] - pt[0]) * (mean1[0] - pt[0]) + (mean1[1] - pt[1]) * (mean1[1] - pt[1]) + (mean1[2] - pt[2]) * (mean1[2] - pt[2]);
-            long dist_from_mean2 = (mean2[0] - pt[0]) * (mean2[0] - pt[0]) + (mean2[1] - pt[1]) * (mean2[1] - pt[1]) + (mean2[2] - pt[2]) * (mean2[2] - pt[2]);
+        for (cv::Vec3b &pt: pixels) {
+            long dist_from_mean1 = (mean1[0] - pt[0]) * (mean1[0] - pt[0]) + (mean1[1] - pt[1]) * (mean1[1] - pt[1]) + (
+                                       mean1[2] - pt[2]) * (mean1[2] - pt[2]);
+            long dist_from_mean2 = (mean2[0] - pt[0]) * (mean2[0] - pt[0]) + (mean2[1] - pt[1]) * (mean2[1] - pt[1]) + (
+                                       mean2[2] - pt[2]) * (mean2[2] - pt[2]);
             if (dist_from_mean1 <= dist_from_mean2) {
                 cluster1_b += pt[0];
                 cluster1_g += pt[1];
@@ -50,8 +52,10 @@ int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
         cv::Vec3b new_mean1 = cv::Vec3b(c1_b, c1_g, c1_r);
         cv::Vec3b new_mean2 = cv::Vec3b(c2_b, c2_g, c2_r);
 
-        long ch1 = (mean1[0] - new_mean1[0]) * (mean1[0] - new_mean1[0]) + (mean1[1] - new_mean1[1]) * (mean1[1] - new_mean1[1]) + (mean1[2] - new_mean1[2]) * (mean1[2] - new_mean1[2]);
-        long ch2 = (mean2[0] - new_mean2[0]) * (mean2[0] - new_mean2[0]) + (mean2[1] - new_mean2[1]) * (mean2[1] - new_mean2[1]) + (mean2[2] - new_mean2[2]) * (mean2[2] - new_mean2[2]);
+        long ch1 = (mean1[0] - new_mean1[0]) * (mean1[0] - new_mean1[0]) + (mean1[1] - new_mean1[1]) * (
+                       mean1[1] - new_mean1[1]) + (mean1[2] - new_mean1[2]) * (mean1[2] - new_mean1[2]);
+        long ch2 = (mean2[0] - new_mean2[0]) * (mean2[0] - new_mean2[0]) + (mean2[1] - new_mean2[1]) * (
+                       mean2[1] - new_mean2[1]) + (mean2[2] - new_mean2[2]) * (mean2[2] - new_mean2[2]);
         bool m1_stop = ch1 <= kmeans_stop_threshold;
         bool m2_stop = ch2 <= kmeans_stop_threshold;
         mean1 = new_mean1;
@@ -68,11 +72,13 @@ int Threshold::dynamic_threshold(cv::Mat &src, cv::Mat &dst) {
 
     dst.create(src.rows, src.cols, CV_8UC1);
     for (int i = 0; i < src.rows; i++) {
-        cv::Vec3b* ptr = src.ptr<cv::Vec3b>(i);
-        uchar* dst_ptr = dst.ptr<uchar>(i);
+        cv::Vec3b *ptr = src.ptr<cv::Vec3b>(i);
+        uchar *dst_ptr = dst.ptr<uchar>(i);
         for (int j = 0; j < src.cols; j++) {
-            long dist_1 = (mean1[0] - ptr[j][0]) * (mean1[0] - ptr[j][0]) + (mean1[1] - ptr[j][1]) * (mean1[1] - ptr[j][1]) + (mean1[2] - ptr[j][2]) * (mean1[2] - ptr[j][2]);
-            long dist_2 = (mean2[0] - ptr[j][0]) * (mean2[0] - ptr[j][0]) + (mean2[1] - ptr[j][1]) * (mean2[1] - ptr[j][1]) + (mean2[2] - ptr[j][2]) * (mean2[2] - ptr[j][2]);
+            long dist_1 = (mean1[0] - ptr[j][0]) * (mean1[0] - ptr[j][0]) + (mean1[1] - ptr[j][1]) * (
+                              mean1[1] - ptr[j][1]) + (mean1[2] - ptr[j][2]) * (mean1[2] - ptr[j][2]);
+            long dist_2 = (mean2[0] - ptr[j][0]) * (mean2[0] - ptr[j][0]) + (mean2[1] - ptr[j][1]) * (
+                              mean2[1] - ptr[j][1]) + (mean2[2] - ptr[j][2]) * (mean2[2] - ptr[j][2]);
             if (dist_1 <= dist_2) {
                 // If dist_1 <= dist_2  ==> It means the pt is closer to mean1 than mean2.
                 // mean1 was the center for black/darker objects. So it is a part of the fg.
@@ -121,4 +127,3 @@ int Threshold::threshold(cv::Mat &src, cv::Mat &dst, const int mode) {
     }
     return it->second(src, dst);
 }
-

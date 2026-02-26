@@ -11,7 +11,7 @@ long long get_time_instant() {
     return ts;
 }
 
-bool check_file(const fs::path& f, const std::set<std::string>& fmts) {
+bool check_file(const fs::path &f, const std::set<std::string> &fmts) {
     bool does_exist = fs::exists(f);
     bool is_regular = fs::is_regular_file(f);
     // bool is_it_empty = fs::is_empty(f);
