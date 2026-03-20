@@ -5,7 +5,12 @@ proj_2/image_database/
 **.idea/
 proj_2/cbir_test/
 proj_2/test_images/
-
+*.png
+*.pdf
+*.docx
+*.csv
+*.jpg
+*.jpeg
 
 #Executables
 #PROJ 1
