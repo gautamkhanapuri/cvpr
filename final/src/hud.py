@@ -58,7 +58,7 @@ EAR_CLOSED_THRESHOLD   = 0.20
 # Consecutive frames below threshold to register a blink
 BLINK_CONSEC_FRAMES    = 2
 # Seconds within which two blinks constitute a double-wink → FIRE
-DOUBLE_WINK_WINDOW_SEC = 2.0
+DOUBLE_WINK_WINDOW_SEC = 1.5
 
 # Harris corner detector parameters
 HARRIS_BLOCK_SIZE  = 3
@@ -75,11 +75,97 @@ HUD_AMBER      = (0,   200, 255)
 HUD_WHITE      = (255, 255, 255)
 HUD_DIM        = (0,   180, 50)
 
-# Simulated telemetry (static display values)
-SIM_SPEED_KNOTS = 312
-SIM_ALT_FEET    = 18500
-SIM_HEADING_DEG = 247
-SIM_G_FORCE     = 2.1
+# Simulated telemetry — initial values (updated dynamically at runtime)
+SIM_SPEED_INIT   = 312      # knots
+SIM_ALT_INIT     = 18500    # feet
+SIM_HEADING_INIT = 247      # degrees
+
+
+# ──────────────────────────────────────────────
+# Flight dynamics simulation
+# ──────────────────────────────────────────────
+
+class FlightSim:
+    """
+    Lightweight flight dynamics driven by head pose.
+
+    Physics model (simplified, arcade-style):
+      - Airspeed:  increases when pitched down, bleeds when pitched up.
+                   Clamped to [120, 600] knots.
+      - Altitude:  climbs when pitched up, descends when pitched down.
+                   Clamped to [500, 60000] feet.
+      - Heading:   turns in the direction of roll (coordinated turn model).
+      - G-force:   1/cos(roll) base (bank contribution) plus a pitch-rate
+                   component so aggressive head swings spike the G-meter.
+                   Smoothed with a low-pass filter to avoid jitter.
+                   Clamped to [1.0, 9.0] G.
+
+    Call update(pitch_deg, roll_deg, dt) every frame.
+    """
+
+    def __init__(self) -> None:
+        self.speed   = float(SIM_SPEED_INIT)
+        self.alt     = float(SIM_ALT_INIT)
+        self.heading = float(SIM_HEADING_INIT)
+        self.g_force = 1.0
+
+        self._prev_pitch: float | None = None
+        self._g_smooth:   float        = 1.0
+
+    def update(self, pitch: float, roll: float, dt: float) -> None:
+        """
+        pitch : calibrated pitch in degrees (+ = nose up)
+        roll  : roll in degrees             (+ = right bank)
+        dt    : seconds since last frame
+        """
+        if dt <= 0 or dt > 1.0:
+            return   # ignore stale or first frame
+
+        # ── Airspeed ──────────────────────────────────────────────────────────
+        # Pitch up → bleed ~3 kts/s per degree above 0; pitch down → gain.
+        speed_rate = -pitch * 3.0
+        self.speed = max(120.0, min(600.0, self.speed + speed_rate * dt))
+
+        # ── Altitude ──────────────────────────────────────────────────────────
+        # Climb/descent rate proportional to pitch and current speed.
+        # Rule of thumb: fpm ≈ speed_knots * sin(pitch) * 101.3
+        climb_fpm  = self.speed * math.sin(math.radians(pitch)) * 101.3
+        self.alt   = max(500.0, min(60000.0, self.alt + climb_fpm * dt / 60.0))
+
+        # ── Heading (coordinated turn) ────────────────────────────────────────
+        # Turn rate (deg/s) = (G * tan(bank)) / (speed_knots * 0.0295)
+        # Simplified: just use tan(roll) scaled to feel right.
+        turn_rate    = math.tan(math.radians(roll)) * (self.speed / 300.0) * 3.0
+        self.heading = (self.heading + turn_rate * dt) % 360.0
+
+        # ── G-force ───────────────────────────────────────────────────────────
+        # Bank contribution: G = 1/cos(roll), capped at 9G
+        bank_g = 1.0 / max(math.cos(math.radians(roll)), 0.12)
+
+        # Pitch rate contribution: fast pitch changes spike G
+        pitch_rate_g = 0.0
+        if self._prev_pitch is not None:
+            pitch_rate    = abs(pitch - self._prev_pitch) / dt   # deg/s
+            pitch_rate_g  = min(pitch_rate * 0.05, 4.0)          # scale to max +4G
+        self._prev_pitch = pitch
+
+        raw_g          = min(bank_g + pitch_rate_g, 9.0)
+        # Low-pass smooth (tau ≈ 0.3s) to avoid single-frame spikes
+        alpha          = dt / (dt + 0.3)
+        self._g_smooth = self._g_smooth + alpha * (raw_g - self._g_smooth)
+        self.g_force   = max(1.0, self._g_smooth)
+
+    @property
+    def speed_int(self) -> int:
+        return int(round(self.speed))
+
+    @property
+    def alt_int(self) -> int:
+        return int(round(self.alt / 100) * 100)   # round to nearest 100 ft
+
+    @property
+    def heading_int(self) -> int:
+        return int(round(self.heading)) % 360
 
 
 # ──────────────────────────────────────────────
@@ -445,25 +531,20 @@ def draw_bank_indicator(frame: np.ndarray, roll: float) -> None:
     cv2.polylines(frame,  [pts], True, HUD_GREEN, 1, cv2.LINE_AA)
 
 
-def draw_heading_tape(frame: np.ndarray, yaw: float) -> None:
-    """
-    Draw heading indicator below the bank angle arc.
-    Positioned at y=120 so it clears the arc (radius=90, centre at y=-2).
-    """
-    h, w    = frame.shape[:2]
-    heading = int(SIM_HEADING_DEG + yaw) % 360
-    text    = f"HDG  {heading:03d}"
-    y_pos   = 120
+def draw_heading_tape(frame: np.ndarray, heading: int) -> None:
+    """Draw heading indicator below the bank angle arc."""
+    h, w   = frame.shape[:2]
+    text   = f"HDG  {heading:03d}"
+    y_pos  = 120
     cv2.putText(frame, text, (w // 2 - 48, y_pos),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_GREEN, 1, cv2.LINE_AA)
-    # Small tick below the text pointing up toward the arc
     cv2.line(frame, (w // 2, y_pos + 4), (w // 2, y_pos + 12),
              HUD_GREEN, 1, cv2.LINE_AA)
 
 
-def draw_telemetry(frame: np.ndarray, pitch: float,
-                   yaw: float, roll: float,
-                   ammo: int, kills: int) -> None:
+def draw_telemetry(frame: np.ndarray, pitch: float, yaw: float, roll: float,
+                   ammo: int, kills: int,
+                   speed: int, alt: int, g_force: float) -> None:
     """Draw speed, altitude, G-force, angle readouts, ammo and kill count."""
     h, w = frame.shape[:2]
     margin = 12
@@ -474,9 +555,10 @@ def draw_telemetry(frame: np.ndarray, pitch: float,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
     # ── Left column ──
-    put(f"SPD  {SIM_SPEED_KNOTS} kts", margin, h - margin - line_h * 3)
-    put(f"ALT  {SIM_ALT_FEET:,} ft",   margin, h - margin - line_h * 2)
-    put(f"G    {SIM_G_FORCE:.1f}",      margin, h - margin - line_h)
+    put(f"SPD  {speed} kts",   margin, h - margin - line_h * 3)
+    put(f"ALT  {alt:,} ft",    margin, h - margin - line_h * 2)
+    g_color = HUD_RED if g_force >= 7.0 else HUD_AMBER if g_force >= 5.0 else HUD_GREEN
+    put(f"G    {g_force:.1f}", margin, h - margin - line_h, g_color)
 
     # ── Right column ──
     put(f"PITCH  {pitch:+.1f}°", w - 155, h - margin - line_h * 3)
@@ -630,6 +712,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     wink_detector = WinkDetector(dominant_eye=args.dominant_eye)
+    flight_sim    = FlightSim()
 
     # ── State ─────────────────────────────────────────────────────────────────
     targets:          list[tuple[int, int]] = []
@@ -640,6 +723,7 @@ def run(args: argparse.Namespace) -> None:
     yaw:              float = 0.0
     roll:             float = 0.0
     fire_flash_until: float = 0.0
+    last_frame_time:  float = time.time()
 
     # Calibration offset — pressing C snapshots current pitch as the zero point
     pitch_offset: float = 0.0
@@ -688,6 +772,12 @@ def run(args: argparse.Namespace) -> None:
         # Apply calibration offset to pitch before any rendering
         calibrated_pitch = pitch - pitch_offset
 
+        # ── Flight simulation update ──────────────────────────────────────────
+        now = time.time()
+        dt  = now - last_frame_time
+        last_frame_time = now
+        flight_sim.update(calibrated_pitch, roll, dt)
+
         # ── Target detection (world camera, periodic) ────────────────────────
         world_frame_count += 1
         if world_frame_count % target_refresh_interval == 0:
@@ -708,11 +798,12 @@ def run(args: argparse.Namespace) -> None:
         # ── HUD rendering ─────────────────────────────────────────────────────
         draw_horizon(world_frame, calibrated_pitch, roll)
         draw_bank_indicator(world_frame, roll)
-        draw_heading_tape(world_frame, yaw)
+        draw_heading_tape(world_frame, flight_sim.heading_int)
         draw_boresight(world_frame)
         draw_targets(world_frame, targets, selected_idx,
                      fired=(time.time() < fire_flash_until))
-        draw_telemetry(world_frame, calibrated_pitch, yaw, roll, ammo, kills)
+        draw_telemetry(world_frame, calibrated_pitch, yaw, roll, ammo, kills,
+                       flight_sim.speed_int, flight_sim.alt_int, flight_sim.g_force)
         draw_fire_flash(world_frame, fire_flash_until)
 
         if ammo == 0:
