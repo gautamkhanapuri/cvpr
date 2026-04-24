@@ -277,60 +277,188 @@ def draw_targets(frame: np.ndarray, targets: list[tuple[int, int]],
             cv2.circle(frame, (x, y),  3, HUD_GREEN, -1)
 
 
+def _rotated_pt(cx: int, cy: int, dx: float, dy: float,
+                roll_rad: float) -> tuple[int, int]:
+    """
+    Rotate offset (dx, dy) by roll_rad around (cx, cy) and return pixel coord.
+    This is the core helper that makes ALL pitch ladder rungs parallel to the
+    horizon — every point is expressed in the tilted frame then rotated back
+    to screen space.
+    """
+    cos_r = math.cos(roll_rad)
+    sin_r = math.sin(roll_rad)
+    sx = dx * cos_r - dy * sin_r
+    sy = dx * sin_r + dy * cos_r
+    return (int(cx + sx), int(cy + sy))
+
+
 def draw_horizon(frame: np.ndarray, pitch: float, roll: float) -> None:
     """
     Draw artificial horizon line and pitch ladder.
-    Horizon tilts with roll; shifts vertically with pitch.
+
+    Conceptual model
+    ----------------
+    The pitch card is fixed to the aircraft, not the camera.  The aircraft
+    symbol and bank arc are painted on the glass (fixed).  The horizon and
+    pitch rungs float behind the glass and move with the aircraft's attitude.
+
+    Sign conventions (matching a real PFD):
+      roll  > 0 → aircraft banks RIGHT  → horizon tilts LEFT on screen
+      pitch > 0 → aircraft nose UP      → horizon moves DOWN on screen
+      +N° rung  → above the horizon line
+      -N° rung  → below the horizon line
+
+    Implementation
+    --------------
+    card_pt(along, perp) maps a point in the tilted card's local frame to
+    screen pixels.  'along' is parallel to the horizon; 'perp' is the card's
+    local up-axis (positive = up on the card = up in the world).
+
+    Roll is negated before building roll_rad so that a positive (right) roll
+    rotates the horizon counter-clockwise on screen — exactly what you see
+    from the cockpit as the world tilts left when banking right.
+
+    Pitch moves the horizon DOWN when positive: the horizon perpendicular
+    offset is +pitch*px_per_deg (positive perp = up on card = downward shift
+    in screen-y because screen-y increases downward).
     """
     h, w = frame.shape[:2]
     cx, cy = w // 2, h // 2
 
-    # Pixels per degree of pitch
     px_per_deg = h / 60.0
-    pitch_offset = int(pitch * px_per_deg)
 
-    roll_rad = math.radians(roll)
+    # Negate roll: tilt right → horizon rotates counter-clockwise on screen
+    roll_rad = math.radians(-roll)
 
-    def horizon_pt(dx: int) -> tuple[int, int]:
-        """Return screen point offset dx from centre along the rolled horizon."""
-        dy = int(dx * math.tan(roll_rad))
-        return (cx + dx, cy - pitch_offset - dy)
+    def card_pt(along: float, perp: float) -> tuple[int, int]:
+        """
+        along : left(-) / right(+) along the horizon
+        perp  : down(-) / up(+) perpendicular to horizon (card local frame)
+        Screen-y increases downward, so card-up maps to -screen-y before rotation.
+        """
+        # In screen space before rotation: right = +x, up = -y
+        sx_local =  along
+        sy_local = -perp          # card up → screen up (negative y)
 
-    # Main horizon line
-    cv2.line(frame, horizon_pt(-w // 3), horizon_pt(w // 3),
-             HUD_GREEN, 1, cv2.LINE_AA)
+        # Rotate by roll_rad (horizon tilt)
+        dx = sx_local * math.cos(roll_rad) - sy_local * math.sin(roll_rad)
+        dy = sx_local * math.sin(roll_rad) + sy_local * math.cos(roll_rad)
 
-    # Pitch ladder: draw lines at ±5, ±10, ±15, ±20 degrees
+        # Pitch shifts the whole card along the card's up-axis.
+        # Positive pitch → nose up → horizon moves DOWN → +screen-y shift
+        pitch_dx = -pitch * px_per_deg * math.sin(roll_rad)
+        pitch_dy =  pitch * px_per_deg * math.cos(roll_rad)
+
+        return (int(cx + dx + pitch_dx), int(cy + dy + pitch_dy))
+
+    # ── 0° horizon line ──────────────────────────────────────────────────────
+    cv2.line(frame,
+             card_pt(-w // 3, 0),
+             card_pt( w // 3, 0),
+             HUD_GREEN, 2, cv2.LINE_AA)
+
+    # ── Pitch ladder rungs ───────────────────────────────────────────────────
+    # Rungs are screen-horizontal (ignore roll) and only slide vertically
+    # with pitch.  Only the horizon line itself tilts with roll.
+    # Pitch shift in screen-y: nose up → horizon drops → rungs shift down too.
+    pitch_screen_y = int(pitch * px_per_deg)
+
     for deg in range(-20, 25, 5):
         if deg == 0:
             continue
-        offset     = int((pitch - deg) * px_per_deg)
-        half_len   = 30 if deg % 10 == 0 else 15
-        label_deg  = deg
 
-        # Centre point of this rung (along tilted axis)
-        bx = int(-offset * math.sin(roll_rad))
-        by = int( offset * math.cos(roll_rad))
+        # Screen-y for this rung: above boresight for positive deg
+        rung_y   = cy + pitch_screen_y - int(deg * px_per_deg)
+        half_len = 35 if deg % 10 == 0 else 18
+        gap      = 20
 
-        # Perpendicular direction
-        px_dir = int(math.cos(roll_rad) * half_len)
-        py_dir = int(math.sin(roll_rad) * half_len)
-
-        p1 = (cx + bx - px_dir, cy - pitch_offset + by + py_dir)
-        p2 = (cx + bx + px_dir, cy - pitch_offset + by - py_dir)
-        cv2.line(frame, p1, p2, HUD_DIM, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"{label_deg:+d}", (p2[0] + 4, p2[1] + 4),
+        cv2.line(frame, (cx - half_len, rung_y), (cx - gap, rung_y),
+                 HUD_DIM, 1, cv2.LINE_AA)
+        cv2.line(frame, (cx + gap, rung_y), (cx + half_len, rung_y),
+                 HUD_DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{deg:+d}", (cx + half_len + 4, rung_y + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, HUD_DIM, 1, cv2.LINE_AA)
 
 
+def draw_bank_indicator(frame: np.ndarray, roll: float) -> None:
+    """
+    Draw bank angle indicator at top of frame.
+
+    Fixed (glass-painted):
+      - Semi-circular arc, open at the bottom
+      - Tick marks at 0, ±10, ±20, ±30, ±45, ±60°
+
+    Moving (driven by roll):
+      - Small triangle whose BASE sits on the arc (outside) and whose
+        APEX points inward toward the arc centre.
+        Roll right → triangle moves right along the arc.
+
+    Arc geometry:
+      Centre of the arc circle is above the top of the frame so only the
+      lower portion of the arc is visible — exactly like a PFD.
+      0° bank = triangle at top-centre of the arc.
+    """
+    h, w   = frame.shape[:2]
+    cx     = w // 2
+    radius = 90
+    cy_arc = radius + 12   # arc centre inside frame — arc is fully visible
+
+    # ── Fixed arc ────────────────────────────────────────────────────────────
+    cv2.ellipse(frame, (cx, cy_arc), (radius, radius),
+                0, 210, 330, HUD_DIM, 1, cv2.LINE_AA)
+
+    # ── Fixed tick marks (drawn inward from arc) ──────────────────────────────
+    tick_angles_deg = [0, 10, 20, 30, 45, 60, -10, -20, -30, -45, -60]
+    for t in tick_angles_deg:
+        # 0° bank = top of arc.  Map to standard math angle: top = 90°.
+        # Right bank (+t) moves clockwise on screen → subtract t from 90°.
+        ang_rad  = math.radians(90 - t)
+        ox = int(cx + radius * math.cos(ang_rad))
+        oy = int(cy_arc - radius * math.sin(ang_rad))
+        tick_len = 10 if t % 30 == 0 else 6
+        ix = int(cx + (radius - tick_len) * math.cos(ang_rad))
+        iy = int(cy_arc - (radius - tick_len) * math.sin(ang_rad))
+        cv2.line(frame, (ox, oy), (ix, iy), HUD_DIM, 1, cv2.LINE_AA)
+
+    # ── Moving triangle ───────────────────────────────────────────────────────
+    # tip sits ON the arc; apex points INWARD toward cy_arc.
+    tri_ang_rad = math.radians(90 - roll)
+    tip_x = int(cx + radius * math.cos(tri_ang_rad))
+    tip_y = int(cy_arc - radius * math.sin(tri_ang_rad))
+
+    # Base is OUTSIDE the arc (away from centre) — two points perpendicular
+    # to the radial direction at the tip
+    perp_rad  = tri_ang_rad + math.pi / 2
+    base_half = 6
+    b1x = int(tip_x + base_half * math.cos(perp_rad))
+    b1y = int(tip_y - base_half * math.sin(perp_rad))
+    b2x = int(tip_x - base_half * math.cos(perp_rad))
+    b2y = int(tip_y + base_half * math.sin(perp_rad))
+
+    # Apex points INWARD (toward cy_arc) — flip the radial direction
+    tri_height = 10
+    inward_x = int(tip_x - tri_height * math.cos(tri_ang_rad))
+    inward_y = int(tip_y + tri_height * math.sin(tri_ang_rad))
+
+    pts = np.array([[b1x, b1y], [b2x, b2y], [inward_x, inward_y]], dtype=np.int32)
+    cv2.fillPoly(frame,   [pts], HUD_GREEN)
+    cv2.polylines(frame,  [pts], True, HUD_GREEN, 1, cv2.LINE_AA)
+
+
 def draw_heading_tape(frame: np.ndarray, yaw: float) -> None:
-    """Draw a simple heading indicator at the top of the frame."""
-    h, w = frame.shape[:2]
+    """
+    Draw heading indicator below the bank angle arc.
+    Positioned at y=120 so it clears the arc (radius=90, centre at y=-2).
+    """
+    h, w    = frame.shape[:2]
     heading = int(SIM_HEADING_DEG + yaw) % 360
-    text = f"HDG  {heading:03d}"
-    cv2.putText(frame, text, (w // 2 - 50, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, HUD_GREEN, 1, cv2.LINE_AA)
-    cv2.line(frame, (w // 2, 32), (w // 2, 40), HUD_GREEN, 1)
+    text    = f"HDG  {heading:03d}"
+    y_pos   = 120
+    cv2.putText(frame, text, (w // 2 - 48, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_GREEN, 1, cv2.LINE_AA)
+    # Small tick below the text pointing up toward the arc
+    cv2.line(frame, (w // 2, y_pos + 4), (w // 2, y_pos + 12),
+             HUD_GREEN, 1, cv2.LINE_AA)
 
 
 def draw_telemetry(frame: np.ndarray, pitch: float,
@@ -367,15 +495,49 @@ def draw_fire_flash(frame: np.ndarray, flash_until: float) -> None:
 
 
 def draw_boresight(frame: np.ndarray) -> None:
-    """Draw fixed centre boresight cross."""
-    h, w = frame.shape[:2]
+    """
+    Draw a fixed aircraft symbol at frame centre.
+    Shape: a small V (fuselage/nose) with horizontal wings extending outward,
+    plus a tiny centre dot.  This symbol is fixed to the glass — it never moves.
+
+    Geometry (all offsets from centre cx, cy):
+      V apex  : (cx, cy + v_depth)          ← nose points down on screen
+      V left  : (cx - v_half, cy)
+      V right : (cx + v_half, cy)
+      Wing tips: (cx ± wing_len, cy)
+      Wing-fuselage join: small vertical stub at each wing root
+    """
+    h, w   = frame.shape[:2]
     cx, cy = w // 2, h // 2
-    r = 8
-    cv2.circle(frame, (cx, cy), r, HUD_WHITE, 1, cv2.LINE_AA)
-    cv2.line(frame, (cx - 20, cy), (cx - r, cy), HUD_WHITE, 1, cv2.LINE_AA)
-    cv2.line(frame, (cx + r,  cy), (cx + 20, cy), HUD_WHITE, 1, cv2.LINE_AA)
-    cv2.line(frame, (cx, cy - 20), (cx, cy - r),  HUD_WHITE, 1, cv2.LINE_AA)
-    cv2.line(frame, (cx, cy + r),  (cx, cy + 20), HUD_WHITE, 1, cv2.LINE_AA)
+
+    v_half   = 10    # half-width of the V
+    v_depth  = 7     # how far down the apex of the V sits
+    wing_len = 28    # total half-span of each wing from centre
+    stub     = 4     # small vertical stub at wing root
+
+    # V shape (nose)
+    apex  = (cx,          cy + v_depth)
+    v_lft = (cx - v_half, cy)
+    v_rgt = (cx + v_half, cy)
+    cv2.line(frame, v_lft, apex, HUD_WHITE, 1, cv2.LINE_AA)
+    cv2.line(frame, v_rgt, apex, HUD_WHITE, 1, cv2.LINE_AA)
+
+    # Left wing: from V left corner outward
+    cv2.line(frame, (cx - v_half, cy), (cx - wing_len, cy),
+             HUD_WHITE, 1, cv2.LINE_AA)
+    # Left wing-root vertical stub
+    cv2.line(frame, (cx - v_half, cy - stub), (cx - v_half, cy + stub),
+             HUD_WHITE, 1, cv2.LINE_AA)
+
+    # Right wing: from V right corner outward
+    cv2.line(frame, (cx + v_half, cy), (cx + wing_len, cy),
+             HUD_WHITE, 1, cv2.LINE_AA)
+    # Right wing-root vertical stub
+    cv2.line(frame, (cx + v_half, cy - stub), (cx + v_half, cy + stub),
+             HUD_WHITE, 1, cv2.LINE_AA)
+
+    # Centre dot
+    cv2.circle(frame, (cx, cy), 2, HUD_WHITE, -1)
 
 
 # ──────────────────────────────────────────────
@@ -514,6 +676,7 @@ def run(args: argparse.Namespace) -> None:
 
         # ── HUD rendering (world camera frame) ───────────────────
         draw_horizon(world_frame, pitch, roll)
+        draw_bank_indicator(world_frame, roll)
         draw_heading_tape(world_frame, yaw)
         draw_boresight(world_frame)
         draw_targets(world_frame, targets, selected_idx,
