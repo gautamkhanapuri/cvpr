@@ -257,8 +257,13 @@ def build_camera_matrix(img_w: int, img_h: int) -> np.ndarray:
 def estimate_head_pose(landmarks, img_w: int, img_h: int):
     """
     Run solvePnP against 6 canonical face landmarks.
-    Returns (pitch_deg, yaw_deg, roll_deg) or None on failure.
-    Pitch: + = looking up, - = looking down
+    Returns (pitch_deg, yaw_deg, roll_deg, rmat) or None on failure.
+
+    Euler angles are used for telemetry readouts and flight simulation.
+    rmat (3x3 rotation matrix) is used for horizon/bank drawing to avoid
+    gimbal lock that destabilises Euler decomposition beyond ±40° yaw.
+
+    Pitch: + = looking up,    - = looking down
     Yaw:   + = looking right, - = looking left
     Roll:  + = tilting right, - = tilting left
     """
@@ -279,8 +284,9 @@ def estimate_head_pose(landmarks, img_w: int, img_h: int):
         return None
 
     rmat, _ = cv2.Rodrigues(rvec)
-    # Decompose rotation matrix to Euler angles
-    sy = math.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
+
+    # Euler angles for telemetry / flight sim (gimbal lock above ~±70° yaw)
+    sy       = math.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
     singular = sy < 1e-6
     if not singular:
         pitch = math.degrees(math.atan2(-rmat[2, 1], rmat[2, 2]))
@@ -291,7 +297,7 @@ def estimate_head_pose(landmarks, img_w: int, img_h: int):
         yaw   = math.degrees(math.atan2( rmat[2, 0], sy))
         roll  = 0.0
 
-    return pitch, yaw, roll
+    return pitch, yaw, roll, rmat
 
 
 # ──────────────────────────────────────────────
@@ -382,122 +388,67 @@ def draw_horizon(frame: np.ndarray, pitch: float, roll: float) -> None:
     """
     Draw artificial horizon line and pitch ladder.
 
-    Conceptual model
-    ----------------
-    The pitch card is fixed to the aircraft, not the camera.  The aircraft
-    symbol and bank arc are painted on the glass (fixed).  The horizon and
-    pitch rungs float behind the glass and move with the aircraft's attitude.
+    Simple direct geometry — no rmat, no gimbal lock risk:
+      - Horizon line is centred on frame centre, rotated by -roll degrees
+        (tilt right → horizon tilts left), shifted vertically by pitch.
+      - Pitch ladder rungs are screen-horizontal, only sliding up/down.
+      - px_per_deg controls sensitivity.
 
-    Sign conventions (matching a real PFD):
-      roll  > 0 → aircraft banks RIGHT  → horizon tilts LEFT on screen
-      pitch > 0 → aircraft nose UP      → horizon moves DOWN on screen
-      +N° rung  → above the horizon line
-      -N° rung  → below the horizon line
-
-    Implementation
-    --------------
-    card_pt(along, perp) maps a point in the tilted card's local frame to
-    screen pixels.  'along' is parallel to the horizon; 'perp' is the card's
-    local up-axis (positive = up on the card = up in the world).
-
-    Roll is negated before building roll_rad so that a positive (right) roll
-    rotates the horizon counter-clockwise on screen — exactly what you see
-    from the cockpit as the world tilts left when banking right.
-
-    Pitch moves the horizon DOWN when positive: the horizon perpendicular
-    offset is +pitch*px_per_deg (positive perp = up on card = downward shift
-    in screen-y because screen-y increases downward).
+    Sign conventions (confirmed from live testing):
+      pitch > 0 → looking up   → horizon shifts DOWN  (cy + pitch*scale)
+      roll  > 0 → tilt right   → horizon rotates CCW  (angle = -roll)
     """
-    h, w = frame.shape[:2]
+    h, w   = frame.shape[:2]
     cx, cy = w // 2, h // 2
 
-    px_per_deg = h / 60.0
+    px_per_deg  = h / 60.0
+    roll_rad    = math.radians(-roll)          # negate: tilt right → CCW
+    pitch_shift = int(pitch * px_per_deg)      # positive → shift down
 
-    # Negate roll: tilt right → horizon rotates counter-clockwise on screen
-    roll_rad = math.radians(-roll)
+    # Horizon centre shifts vertically with pitch
+    horizon_cy = cy + pitch_shift
 
-    def card_pt(along: float, perp: float) -> tuple[int, int]:
-        """
-        along : left(-) / right(+) along the horizon
-        perp  : down(-) / up(+) perpendicular to horizon (card local frame)
-        Screen-y increases downward, so card-up maps to -screen-y before rotation.
-        """
-        # In screen space before rotation: right = +x, up = -y
-        sx_local =  along
-        sy_local = -perp          # card up → screen up (negative y)
+    # Horizon endpoints: rotate ±(w//3) around (cx, horizon_cy)
+    half_len = w // 3
+    cos_r    = math.cos(roll_rad)
+    sin_r    = math.sin(roll_rad)
+    lx = int(cx - half_len * cos_r)
+    ly = int(horizon_cy - half_len * sin_r)
+    rx = int(cx + half_len * cos_r)
+    ry = int(horizon_cy + half_len * sin_r)
+    cv2.line(frame, (lx, ly), (rx, ry), HUD_GREEN, 2, cv2.LINE_AA)
 
-        # Rotate by roll_rad (horizon tilt)
-        dx = sx_local * math.cos(roll_rad) - sy_local * math.sin(roll_rad)
-        dy = sx_local * math.sin(roll_rad) + sy_local * math.cos(roll_rad)
-
-        # Pitch shifts the whole card along the card's up-axis.
-        # Positive pitch → nose up → horizon moves DOWN → +screen-y shift
-        pitch_dx = -pitch * px_per_deg * math.sin(roll_rad)
-        pitch_dy =  pitch * px_per_deg * math.cos(roll_rad)
-
-        return (int(cx + dx + pitch_dx), int(cy + dy + pitch_dy))
-
-    # ── 0° horizon line ──────────────────────────────────────────────────────
-    cv2.line(frame,
-             card_pt(-w // 3, 0),
-             card_pt( w // 3, 0),
-             HUD_GREEN, 2, cv2.LINE_AA)
-
-    # ── Pitch ladder rungs ───────────────────────────────────────────────────
-    # Rungs are screen-horizontal (ignore roll) and only slide vertically
-    # with pitch.  Only the horizon line itself tilts with roll.
-    # Pitch shift in screen-y: nose up → horizon drops → rungs shift down too.
-    pitch_screen_y = int(pitch * px_per_deg)
-
+    # ── Pitch ladder rungs (screen-horizontal, slide with pitch only) ─────────
     for deg in range(-20, 25, 5):
         if deg == 0:
             continue
-
-        # Screen-y for this rung: above boresight for positive deg
-        rung_y   = cy + pitch_screen_y - int(deg * px_per_deg)
-        half_len = 35 if deg % 10 == 0 else 18
-        gap      = 20
-
-        cv2.line(frame, (cx - half_len, rung_y), (cx - gap, rung_y),
+        rung_y   = cy + pitch_shift - int(deg * px_per_deg)
+        half_len_r = 35 if deg % 10 == 0 else 18
+        gap        = 20
+        cv2.line(frame, (cx - half_len_r, rung_y), (cx - gap, rung_y),
                  HUD_DIM, 1, cv2.LINE_AA)
-        cv2.line(frame, (cx + gap, rung_y), (cx + half_len, rung_y),
+        cv2.line(frame, (cx + gap, rung_y), (cx + half_len_r, rung_y),
                  HUD_DIM, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"{deg:+d}", (cx + half_len + 4, rung_y + 4),
+        cv2.putText(frame, f"{deg:+d}", (cx + half_len_r + 4, rung_y + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, HUD_DIM, 1, cv2.LINE_AA)
 
 
 def draw_bank_indicator(frame: np.ndarray, roll: float) -> None:
     """
-    Draw bank angle indicator at top of frame.
-
-    Fixed (glass-painted):
-      - Semi-circular arc, open at the bottom
-      - Tick marks at 0, ±10, ±20, ±30, ±45, ±60°
-
-    Moving (driven by roll):
-      - Small triangle whose BASE sits on the arc (outside) and whose
-        APEX points inward toward the arc centre.
-        Roll right → triangle moves right along the arc.
-
-    Arc geometry:
-      Centre of the arc circle is above the top of the frame so only the
-      lower portion of the arc is visible — exactly like a PFD.
-      0° bank = triangle at top-centre of the arc.
+    Draw bank angle indicator using Euler roll angle directly.
+    Tilt right (roll > 0) → triangle moves right along arc.
     """
     h, w   = frame.shape[:2]
     cx     = w // 2
     radius = 90
-    cy_arc = radius + 12   # arc centre inside frame — arc is fully visible
+    cy_arc = radius + 12
 
     # ── Fixed arc ────────────────────────────────────────────────────────────
     cv2.ellipse(frame, (cx, cy_arc), (radius, radius),
                 0, 210, 330, HUD_DIM, 1, cv2.LINE_AA)
 
-    # ── Fixed tick marks (drawn inward from arc) ──────────────────────────────
-    tick_angles_deg = [0, 10, 20, 30, 45, 60, -10, -20, -30, -45, -60]
-    for t in tick_angles_deg:
-        # 0° bank = top of arc.  Map to standard math angle: top = 90°.
-        # Right bank (+t) moves clockwise on screen → subtract t from 90°.
+    # ── Fixed tick marks ─────────────────────────────────────────────────────
+    for t in [0, 10, 20, 30, 45, 60, -10, -20, -30, -45, -60]:
         ang_rad  = math.radians(90 - t)
         ox = int(cx + radius * math.cos(ang_rad))
         oy = int(cy_arc - radius * math.sin(ang_rad))
@@ -507,10 +458,24 @@ def draw_bank_indicator(frame: np.ndarray, roll: float) -> None:
         cv2.line(frame, (ox, oy), (ix, iy), HUD_DIM, 1, cv2.LINE_AA)
 
     # ── Moving triangle ───────────────────────────────────────────────────────
-    # tip sits ON the arc; apex points INWARD toward cy_arc.
     tri_ang_rad = math.radians(90 - roll)
     tip_x = int(cx + radius * math.cos(tri_ang_rad))
     tip_y = int(cy_arc - radius * math.sin(tri_ang_rad))
+
+    perp_rad  = tri_ang_rad + math.pi / 2
+    base_half = 6
+    b1x = int(tip_x + base_half * math.cos(perp_rad))
+    b1y = int(tip_y - base_half * math.sin(perp_rad))
+    b2x = int(tip_x - base_half * math.cos(perp_rad))
+    b2y = int(tip_y + base_half * math.sin(perp_rad))
+
+    tri_height = 10
+    inward_x = int(tip_x - tri_height * math.cos(tri_ang_rad))
+    inward_y = int(tip_y + tri_height * math.sin(tri_ang_rad))
+
+    pts = np.array([[b1x, b1y], [b2x, b2y], [inward_x, inward_y]], dtype=np.int32)
+    cv2.fillPoly(frame,  [pts], HUD_GREEN)
+    cv2.polylines(frame, [pts], True, HUD_GREEN, 1, cv2.LINE_AA)
 
     # Base is OUTSIDE the arc (away from centre) — two points perpendicular
     # to the radial direction at the tip
@@ -684,17 +649,109 @@ class WinkDetector:
 
 def draw_face_mesh(frame: np.ndarray, landmarks, img_w: int, img_h: int) -> None:
     """Draw a minimal face mesh overlay on the face camera frame."""
-    mp_drawing = mp.solutions.drawing_utils
-    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing    = mp.solutions.drawing_utils
+    mp_face_mesh_ = mp.solutions.face_mesh
     mp_drawing.draw_landmarks(
         image=frame,
         landmark_list=landmarks,
-        connections=mp_face_mesh.FACEMESH_TESSELATION,
+        connections=mp_face_mesh_.FACEMESH_TESSELATION,
         landmark_drawing_spec=None,
         connection_drawing_spec=mp_drawing.DrawingSpec(
             color=(0, 200, 0), thickness=1, circle_radius=0
         )
     )
+
+
+# ──────────────────────────────────────────────
+# Optical flow tracker
+# ──────────────────────────────────────────────
+
+class OpticalFlowTracker:
+    """
+    Tracks a single scene point across frames using Lucas-Kanade optical flow.
+
+    Interaction model:
+      lock(frame, point)  — seed tracker on (x,y); samples nearby corners
+      update(frame)       — propagate to next frame; returns centroid or None
+      reset()             — stop tracking
+
+    If fewer than MIN_POINTS survive an LK iteration, tracking is abandoned.
+    """
+
+    LK_PARAMS  = dict(winSize=(21, 21), maxLevel=3,
+                      criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                                30, 0.01))
+    MIN_POINTS = 3
+    PATCH_R    = 20
+
+    def __init__(self) -> None:
+        self._pts:       np.ndarray | None = None
+        self._prev_gray: np.ndarray | None = None
+        self.active:     bool              = False
+
+    def lock(self, frame: np.ndarray, point: tuple[int, int]) -> None:
+        """Initialise tracking around (x, y)."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        x, y = point
+        x1 = max(0, x - self.PATCH_R);  y1 = max(0, y - self.PATCH_R)
+        x2 = min(frame.shape[1], x + self.PATCH_R)
+        y2 = min(frame.shape[0], y + self.PATCH_R)
+        roi = np.float32(gray[y1:y2, x1:x2])
+
+        corners = None
+        if roi.size > 0:
+            corners = cv2.goodFeaturesToTrack(roi, maxCorners=10,
+                                              qualityLevel=0.2, minDistance=5)
+        if corners is None or len(corners) < self.MIN_POINTS:
+            corners = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        else:
+            corners[:, :, 0] += x1
+            corners[:, :, 1] += y1
+
+        self._pts       = corners
+        self._prev_gray = gray
+        self.active     = True
+
+    def update(self, frame: np.ndarray) -> tuple[int, int] | None:
+        """Propagate tracked points; return centroid or None if lost."""
+        if not self.active or self._pts is None or self._prev_gray is None:
+            return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray, gray, self._pts, None, **self.LK_PARAMS
+        )
+
+        if new_pts is None or status is None:
+            self.reset(); return None
+
+        good = new_pts[status.flatten() == 1]
+        if len(good) < self.MIN_POINTS:
+            self.reset(); return None
+
+        self._pts       = good.reshape(-1, 1, 2)
+        self._prev_gray = gray
+        good_2d = good.reshape(-1, 2)
+        return (int(np.mean(good_2d[:, 0])), int(np.mean(good_2d[:, 1])))
+
+    def reset(self) -> None:
+        self._pts = None; self._prev_gray = None; self.active = False
+
+
+def draw_tracked_target(frame: np.ndarray, pos: tuple[int, int],
+                        fired: bool) -> None:
+    """Animated tracking reticle — larger than the static Harris reticle."""
+    x, y  = pos
+    color = HUD_RED if not fired else (0, 0, 255)
+    label = "TRACKING" if not fired else "SPLASH"
+    for r in (22, 34, 46):
+        cv2.circle(frame, (x, y), r, color, 1, cv2.LINE_AA)
+    cv2.line(frame, (x - 55, y), (x - 25, y), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (x + 25, y), (x + 55, y), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (x, y - 55), (x, y - 25), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (x, y + 25), (x, y + 55), color, 1, cv2.LINE_AA)
+    cv2.putText(frame, label, (x + 50, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -713,31 +770,39 @@ def run(args: argparse.Namespace) -> None:
 
     wink_detector = WinkDetector(dominant_eye=args.dominant_eye)
     flight_sim    = FlightSim()
+    tracker       = OpticalFlowTracker()
 
     # ── State ─────────────────────────────────────────────────────────────────
-    targets:          list[tuple[int, int]] = []
-    selected_idx:     int   = 0
-    ammo:             int   = 4
-    kills:            int   = 0
-    pitch:            float = 0.0
-    yaw:              float = 0.0
-    roll:             float = 0.0
-    fire_flash_until: float = 0.0
-    last_frame_time:  float = time.time()
+    targets:          list[tuple[int, int]]      = []
+    selected_idx:     int                        = 0
+    ammo:             int                        = 4
+    kills:            int                        = 0
+    pitch:            float                      = 0.0
+    yaw:              float                      = 0.0
+    roll:             float                      = 0.0
+    rmat:             np.ndarray                 = np.eye(3)
+    fire_flash_until: float                      = 0.0
+    pitch_smooth:     float                      = 0.0
+    roll_smooth:      float                      = 0.0
+    last_frame_time:  float                      = time.time()
+    tracked_pos:      tuple[int, int] | None     = None
+    pitch_offset:     float                      = 0.0
+    show_mirror:      bool                       = True
+    show_face_mesh:   bool                       = False
 
-    # Calibration offset — pressing C snapshots current pitch as the zero point
-    pitch_offset: float = 0.0
-
-    # UI toggles
-    show_mirror:    bool = True   # M — show/hide face camera window
-    show_face_mesh: bool = False  # F — overlay face mesh on face camera feed
+    save_dir         = "hud_captures"
+    os.makedirs(save_dir, exist_ok=True)
+    screenshot_count = 0
 
     target_refresh_interval = 15
     world_frame_count       = 0
 
     print("[HUD] Running.")
-    print("  Q — quit  |  M — toggle mirror  |  F — toggle face mesh  |  C — calibrate pitch")
-    print(f"  World cam : {args.world_cam}  |  Face cam : {args.face_cam}  |  Dominant eye : {args.dominant_eye}")
+    print("  Q — quit  |  M — mirror  |  F — face mesh  |  C — calibrate pitch")
+    print("  S — save frame  |  L — lock/unlock tracker on selected target")
+    print("  Wink       — cycle targets  (or unlock tracker if active)")
+    print("  Double wink — lock tracker  (or FIRE if tracker active)")
+    print(f"  World cam: {args.world_cam}  |  Face cam: {args.face_cam}  |  Eye: {args.dominant_eye}")
 
     while True:
         world_frame = read_frame(world_cap)
@@ -750,7 +815,7 @@ def run(args: argparse.Namespace) -> None:
         world_h, world_w = world_frame.shape[:2]
         face_h,  face_w  = face_frame.shape[:2]
 
-        # ── Face tracking ────────────────────────────────────────────────────
+        # ── Face tracking ─────────────────────────────────────────────────────
         face_rgb = cv2.cvtColor(face_frame, cv2.COLOR_BGR2RGB)
         face_rgb.flags.writeable = False
         results = face_mesh.process(face_rgb)
@@ -765,55 +830,85 @@ def run(args: argparse.Namespace) -> None:
 
             pose = estimate_head_pose(landmarks, face_w, face_h)
             if pose is not None:
-                pitch, yaw, roll = pose
+                pitch, yaw, roll, rmat = pose
+                if abs(roll) < 90.0:
+                    alpha        = 0.25
+                    pitch_smooth = pitch_smooth + alpha * (pitch - pitch_smooth)
+                    roll_smooth  = roll_smooth  + alpha * (roll  - roll_smooth)
+                    pitch_smooth = max(-30.0, min(30.0, pitch_smooth))
 
             wink_event = wink_detector.update(landmarks, face_w, face_h)
 
-        # Apply calibration offset to pitch before any rendering
-        calibrated_pitch = pitch - pitch_offset
+        calibrated_pitch = pitch_smooth - pitch_offset
 
-        # ── Flight simulation update ──────────────────────────────────────────
+        # ── Flight simulation ──────────────────────────────────────────────────
         now = time.time()
         dt  = now - last_frame_time
         last_frame_time = now
-        flight_sim.update(calibrated_pitch, roll, dt)
+        flight_sim.update(calibrated_pitch, roll_smooth, dt)
 
-        # ── Target detection (world camera, periodic) ────────────────────────
+        # ── Optical flow update ────────────────────────────────────────────────
+        if tracker.active:
+            tracked_pos = tracker.update(world_frame)
+            if tracked_pos is None:
+                print("[HUD] Tracking lost — reverting to Harris targets.")
+
+        # ── Target detection (suspended while tracking) ───────────────────────
         world_frame_count += 1
-        if world_frame_count % target_refresh_interval == 0:
+        if not tracker.active and world_frame_count % target_refresh_interval == 0:
             new_targets = detect_targets(world_frame)
             if new_targets:
                 targets      = new_targets
                 selected_idx = min(selected_idx, len(targets) - 1)
 
         # ── Gesture events ────────────────────────────────────────────────────
-        if wink_event == "single" and targets:
-            selected_idx = (selected_idx + 1) % len(targets)
+        if wink_event == "single":
+            if tracker.active:
+                tracker.reset()
+                tracked_pos = None
+                print("[HUD] Tracker unlocked.")
+            elif targets:
+                selected_idx = (selected_idx + 1) % len(targets)
 
-        elif wink_event == "double" and targets and ammo > 0:
-            ammo            -= 1
-            kills           += 1
-            fire_flash_until = time.time() + 1.2
+        elif wink_event == "double":
+            if not tracker.active and targets:
+                lock_pt = targets[selected_idx]
+                tracker.lock(world_frame, lock_pt)
+                tracked_pos = lock_pt
+                print(f"[HUD] Tracker locked on {lock_pt}.")
+            elif tracker.active and tracked_pos is not None and ammo > 0:
+                ammo            -= 1
+                kills           += 1
+                fire_flash_until = time.time() + 1.2
+                print(f"[HUD] FIRE — kills: {kills}  ammo: {ammo}")
 
         # ── HUD rendering ─────────────────────────────────────────────────────
-        draw_horizon(world_frame, calibrated_pitch, roll)
-        draw_bank_indicator(world_frame, roll)
+        draw_horizon(world_frame, calibrated_pitch, roll_smooth)
+        draw_bank_indicator(world_frame, roll_smooth)
         draw_heading_tape(world_frame, flight_sim.heading_int)
         draw_boresight(world_frame)
-        draw_targets(world_frame, targets, selected_idx,
-                     fired=(time.time() < fire_flash_until))
-        draw_telemetry(world_frame, calibrated_pitch, yaw, roll, ammo, kills,
+
+        if tracker.active and tracked_pos is not None:
+            draw_tracked_target(world_frame, tracked_pos,
+                                fired=(time.time() < fire_flash_until))
+            cv2.putText(world_frame, "TRK", (12, world_h - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_AMBER, 1, cv2.LINE_AA)
+        else:
+            draw_targets(world_frame, targets, selected_idx,
+                         fired=(time.time() < fire_flash_until))
+
+        draw_telemetry(world_frame, calibrated_pitch, yaw, roll_smooth, ammo, kills,
                        flight_sim.speed_int, flight_sim.alt_int, flight_sim.g_force)
         draw_fire_flash(world_frame, fire_flash_until)
 
         if ammo == 0:
-            h, w = world_frame.shape[:2]
-            cv2.putText(world_frame, "WINCHESTER", (w // 2 - 80, 60),
+            cv2.putText(world_frame, "WINCHESTER",
+                        (world_w // 2 - 80, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, HUD_RED, 2, cv2.LINE_AA)
 
         cv2.imshow("HUD — World View", world_frame)
 
-        # ── Face mirror window ────────────────────────────────────────────────
+        # ── Face mirror ────────────────────────────────────────────────────────
         if show_mirror:
             display_face = cv2.resize(face_frame, (320, 240))
             if show_face_mesh and raw_landmarks is not None:
@@ -821,7 +916,6 @@ def run(args: argparse.Namespace) -> None:
                                display_face.shape[1], display_face.shape[0])
             cv2.imshow("Face Tracking", display_face)
         else:
-            # Destroy window if it was open and user toggled it off
             try:
                 cv2.destroyWindow("Face Tracking")
             except Exception:
@@ -836,8 +930,23 @@ def run(args: argparse.Namespace) -> None:
         elif key == ord("f"):
             show_face_mesh = not show_face_mesh
         elif key == ord("c"):
-            pitch_offset = pitch
+            pitch_offset = pitch_smooth
             print(f"[HUD] Pitch calibrated — offset set to {pitch_offset:+.1f}°")
+        elif key == ord("s"):
+            fname = os.path.join(save_dir, f"hud_{screenshot_count:04d}.png")
+            cv2.imwrite(fname, world_frame)
+            screenshot_count += 1
+            print(f"[HUD] Saved {fname}")
+        elif key == ord("l"):
+            if tracker.active:
+                tracker.reset()
+                tracked_pos = None
+                print("[HUD] Tracker unlocked.")
+            elif targets:
+                lock_pt = targets[selected_idx]
+                tracker.lock(world_frame, lock_pt)
+                tracked_pos = lock_pt
+                print(f"[HUD] Tracker locked on {lock_pt}.")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     face_mesh.close()
