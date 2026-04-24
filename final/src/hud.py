@@ -663,95 +663,245 @@ def draw_face_mesh(frame: np.ndarray, landmarks, img_w: int, img_h: int) -> None
 
 
 # ──────────────────────────────────────────────
-# Optical flow tracker
+# Dynamic object tracker (Mode B)
 # ──────────────────────────────────────────────
 
-class OpticalFlowTracker:
+class DynamicTracker:
     """
-    Tracks a single scene point across frames using Lucas-Kanade optical flow.
+    Tracks up to MAX_OBJECTS moving objects using a consensus of:
+      1. MOG2 background subtraction  — detects moving regions (bounding boxes)
+      2. CSRT tracker                 — robust bounding-box tracker per object
+      3. Lucas-Kanade optical flow    — point-level backup per object
 
-    Interaction model:
-      lock(frame, point)  — seed tracker on (x,y); samples nearby corners
-      update(frame)       — propagate to next frame; returns centroid or None
-      reset()             — stop tracking
+    Workflow:
+      update(frame) — call every frame; returns list of TrackedObject
+      reset()       — stop all tracking, clear background model
 
-    If fewer than MIN_POINTS survive an LK iteration, tracking is abandoned.
+    TrackedObject is a namedtuple: (box, centroid, active)
+      box      : (x, y, w, h) bounding box
+      centroid : (cx, cy)
+      active   : True if both CSRT and LK agree (consensus), else False
     """
 
-    LK_PARAMS  = dict(winSize=(21, 21), maxLevel=3,
-                      criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                                30, 0.01))
-    MIN_POINTS = 3
-    PATCH_R    = 20
+    MAX_OBJECTS   = 2
+    MIN_AREA      = 2000    # px² — ignore tiny motion blobs
+    CONSENSUS_TOL = 80      # px  — max distance between CSRT and LK centroids
+
+    LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                               30, 0.01))
 
     def __init__(self) -> None:
-        self._pts:       np.ndarray | None = None
-        self._prev_gray: np.ndarray | None = None
-        self.active:     bool              = False
+        self._bg       = cv2.createBackgroundSubtractorMOG2(
+                            history=300, varThreshold=40, detectShadows=False)
+        self._csrt:    list                        = []   # cv2.TrackerCSRT per obj
+        self._lk_pts:  list[np.ndarray | None]    = []   # LK point set per obj
+        self._prev_gray: np.ndarray | None         = None
+        self._boxes:   list[tuple]                 = []   # current boxes
+        self.initialized: bool                     = False
 
-    def lock(self, frame: np.ndarray, point: tuple[int, int]) -> None:
-        """Initialise tracking around (x, y)."""
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _detect_moving_boxes(self, frame: np.ndarray) -> list[tuple[int,int,int,int]]:
+        """Return up to MAX_OBJECTS largest bounding boxes of moving regions."""
+        fg    = self._bg.apply(frame)
+        # Morphological clean-up: remove noise, fill gaps
+        kern  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        fg    = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  kern)
+        fg    = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kern)
+        cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in cnts:
+            if cv2.contourArea(c) < self.MIN_AREA:
+                continue
+            boxes.append(cv2.boundingRect(c))
+        # Sort by area descending, keep top MAX_OBJECTS
+        boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+        return boxes[:self.MAX_OBJECTS]
+
+    def _init_lk(self, frame: np.ndarray,
+                 box: tuple[int,int,int,int]) -> np.ndarray | None:
+        """Seed LK feature points inside a bounding box."""
+        x, y, w, h = box
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        x, y = point
-        x1 = max(0, x - self.PATCH_R);  y1 = max(0, y - self.PATCH_R)
-        x2 = min(frame.shape[1], x + self.PATCH_R)
-        y2 = min(frame.shape[0], y + self.PATCH_R)
-        roi = np.float32(gray[y1:y2, x1:x2])
-
-        corners = None
-        if roi.size > 0:
-            corners = cv2.goodFeaturesToTrack(roi, maxCorners=10,
-                                              qualityLevel=0.2, minDistance=5)
-        if corners is None or len(corners) < self.MIN_POINTS:
-            corners = np.array([[[float(x), float(y)]]], dtype=np.float32)
-        else:
-            corners[:, :, 0] += x1
-            corners[:, :, 1] += y1
-
-        self._pts       = corners
-        self._prev_gray = gray
-        self.active     = True
-
-    def update(self, frame: np.ndarray) -> tuple[int, int] | None:
-        """Propagate tracked points; return centroid or None if lost."""
-        if not self.active or self._pts is None or self._prev_gray is None:
+        roi  = gray[y:y+h, x:x+w]
+        pts  = cv2.goodFeaturesToTrack(np.float32(roi), maxCorners=15,
+                                       qualityLevel=0.2, minDistance=5)
+        if pts is None:
             return None
+        pts[:, :, 0] += x
+        pts[:, :, 1] += y
+        return pts
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def _lk_centroid(self, prev_gray: np.ndarray, gray: np.ndarray,
+                     pts: np.ndarray) -> tuple[np.ndarray | None, tuple | None]:
+        """Run one LK step; return (new_pts, centroid) or (None, None)."""
         new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-            self._prev_gray, gray, self._pts, None, **self.LK_PARAMS
-        )
-
+            prev_gray, gray, pts, None, **self.LK_PARAMS)
         if new_pts is None or status is None:
-            self.reset(); return None
+            return None, None
+        good = new_pts[status.flatten() == 1].reshape(-1, 2)
+        if len(good) < 3:
+            return None, None
+        return good.reshape(-1, 1, 2), (int(np.mean(good[:, 0])),
+                                         int(np.mean(good[:, 1])))
 
-        good = new_pts[status.flatten() == 1]
-        if len(good) < self.MIN_POINTS:
-            self.reset(); return None
+    # ── Public API ────────────────────────────────────────────────────────────
 
-        self._pts       = good.reshape(-1, 1, 2)
+    def update(self, frame: np.ndarray) -> list[dict]:
+        """
+        Process one frame.  Returns a list of dicts (up to MAX_OBJECTS):
+          { 'box': (x,y,w,h), 'centroid': (cx,cy), 'consensus': bool }
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # ── Phase 1: background subtraction finds new moving boxes ────────────
+        moving_boxes = self._detect_moving_boxes(frame)
+
+        # Re-initialise CSRT / LK whenever the detected box count changes
+        # or on the first call.
+        if not self.initialized or len(moving_boxes) != len(self._csrt):
+            self._csrt   = []
+            self._lk_pts = []
+            self._boxes  = []
+            for box in moving_boxes:
+                t = cv2.TrackerCSRT_create()
+                t.init(frame, box)
+                self._csrt.append(t)
+                self._lk_pts.append(self._init_lk(frame, box))
+                self._boxes.append(box)
+            self._prev_gray   = gray
+            self.initialized  = True
+            # Return initial positions
+            results = []
+            for box in moving_boxes:
+                x, y, w, h = box
+                results.append({'box': box,
+                                'centroid': (x + w // 2, y + h // 2),
+                                'consensus': False})
+            return results
+
+        # ── Phase 2: update each tracker ─────────────────────────────────────
+        results = []
+        new_csrt   = []
+        new_lk_pts = []
+        new_boxes  = []
+
+        for i, (t, lk_pts) in enumerate(zip(self._csrt, self._lk_pts)):
+            # CSRT update
+            ok, csrt_box = t.update(frame)
+            if not ok:
+                continue   # CSRT lost this object — drop it
+            csrt_box  = tuple(int(v) for v in csrt_box)
+            x, y, w, h = csrt_box
+            csrt_c    = (x + w // 2, y + h // 2)
+
+            # LK update
+            lk_c = None
+            new_lk = lk_pts
+            if lk_pts is not None and self._prev_gray is not None:
+                new_lk, lk_c = self._lk_centroid(self._prev_gray, gray, lk_pts)
+
+            # Consensus: do CSRT and LK agree?
+            consensus = False
+            if lk_c is not None:
+                dist = math.hypot(csrt_c[0] - lk_c[0], csrt_c[1] - lk_c[1])
+                consensus = dist < self.CONSENSUS_TOL
+                # Fused centroid: average when in consensus
+                if consensus:
+                    fused_c = ((csrt_c[0] + lk_c[0]) // 2,
+                               (csrt_c[1] + lk_c[1]) // 2)
+                else:
+                    fused_c = csrt_c   # fall back to CSRT alone
+            else:
+                fused_c = csrt_c
+
+            results.append({'box': csrt_box, 'centroid': fused_c,
+                            'consensus': consensus})
+            new_csrt.append(t)
+            new_lk_pts.append(new_lk)
+            new_boxes.append(csrt_box)
+
+        self._csrt      = new_csrt
+        self._lk_pts    = new_lk_pts
+        self._boxes     = new_boxes
         self._prev_gray = gray
-        good_2d = good.reshape(-1, 2)
-        return (int(np.mean(good_2d[:, 0])), int(np.mean(good_2d[:, 1])))
+        return results
 
     def reset(self) -> None:
-        self._pts = None; self._prev_gray = None; self.active = False
+        self._csrt        = []
+        self._lk_pts      = []
+        self._boxes       = []
+        self._prev_gray   = None
+        self.initialized  = False
+        # Reset background model so it re-learns the new scene
+        self._bg          = cv2.createBackgroundSubtractorMOG2(
+                                history=300, varThreshold=40,
+                                detectShadows=False)
 
 
-def draw_tracked_target(frame: np.ndarray, pos: tuple[int, int],
-                        fired: bool) -> None:
-    """Animated tracking reticle — larger than the static Harris reticle."""
-    x, y  = pos
-    color = HUD_RED if not fired else (0, 0, 255)
-    label = "TRACKING" if not fired else "SPLASH"
-    for r in (22, 34, 46):
-        cv2.circle(frame, (x, y), r, color, 1, cv2.LINE_AA)
-    cv2.line(frame, (x - 55, y), (x - 25, y), color, 1, cv2.LINE_AA)
-    cv2.line(frame, (x + 25, y), (x + 55, y), color, 1, cv2.LINE_AA)
-    cv2.line(frame, (x, y - 55), (x, y - 25), color, 1, cv2.LINE_AA)
-    cv2.line(frame, (x, y + 25), (x, y + 55), color, 1, cv2.LINE_AA)
-    cv2.putText(frame, label, (x + 50, y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+# ──────────────────────────────────────────────
+# HUD drawing — dynamic mode
+# ──────────────────────────────────────────────
+
+def draw_dynamic_targets(frame: np.ndarray,
+                         objects: list[dict],
+                         selected_idx: int,
+                         fired: bool) -> None:
+    """
+    Draw bounding boxes and reticles for Mode B (dynamic tracking).
+      - Unselected objects: amber bounding box + centroid dot
+      - Selected object:    red concentric reticle + crosshair + TRACKING label
+      - Consensus indicator: small green dot in top-left corner of box
+    """
+    for i, obj in enumerate(objects):
+        x, y, w, h  = obj['box']
+        cx, cy       = obj['centroid']
+        is_selected  = (i == selected_idx)
+        consensus    = obj['consensus']
+
+        if is_selected:
+            color = HUD_RED if not fired else (0, 0, 255)
+            label = "TRACKING" if not fired else "SPLASH"
+            # Bounding box
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1, cv2.LINE_AA)
+            # Concentric reticle at centroid
+            for r in (18, 28, 38):
+                cv2.circle(frame, (cx, cy), r, color, 1, cv2.LINE_AA)
+            cv2.line(frame, (cx - 50, cy), (cx - 20, cy), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (cx + 20, cy), (cx + 50, cy), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (cx, cy - 50), (cx, cy - 20), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (cx, cy + 20), (cx, cy + 50), color, 1, cv2.LINE_AA)
+            cv2.putText(frame, label, (x, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+        else:
+            # Unselected: amber box + small circle
+            cv2.rectangle(frame, (x, y), (x + w, y + h),
+                          HUD_AMBER, 1, cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), 4, HUD_AMBER, -1)
+
+        # Consensus indicator: small green dot = both algorithms agree
+        if consensus:
+            cv2.circle(frame, (x + 6, y + 6), 4, HUD_GREEN, -1)
+
+
+# ──────────────────────────────────────────────
+# Main application loop
+# ──────────────────────────────────────────────
+
+def draw_face_mesh(frame: np.ndarray, landmarks,
+                   img_w: int, img_h: int) -> None:
+    """Draw minimal face mesh overlay on face camera frame."""
+    mp_drawing    = mp.solutions.drawing_utils
+    mp_face_mesh_ = mp.solutions.face_mesh
+    mp_drawing.draw_landmarks(
+        image=frame,
+        landmark_list=landmarks,
+        connections=mp_face_mesh_.FACEMESH_TESSELATION,
+        landmark_drawing_spec=None,
+        connection_drawing_spec=mp_drawing.DrawingSpec(
+            color=(0, 200, 0), thickness=1, circle_radius=0)
+    )
 
 
 def run(args: argparse.Namespace) -> None:
@@ -762,19 +912,24 @@ def run(args: argparse.Namespace) -> None:
 
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        max_num_faces=1, refine_landmarks=True,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5,
     )
 
-    wink_detector = WinkDetector(dominant_eye=args.dominant_eye)
-    flight_sim    = FlightSim()
-    tracker       = OpticalFlowTracker()
+    wink_detector  = WinkDetector(dominant_eye=args.dominant_eye)
+    flight_sim     = FlightSim()
+    dyn_tracker    = DynamicTracker()
 
     # ── State ─────────────────────────────────────────────────────────────────
-    targets:          list[tuple[int, int]]      = []
-    selected_idx:     int                        = 0
+    # Targeting mode: 'harris' or 'dynamic'
+    mode:             str                        = 'harris'
+
+    targets:          list[tuple[int, int]]      = []   # Harris mode
+    harris_sel:       int                        = 0
+
+    dyn_objects:      list[dict]                 = []   # Dynamic mode
+    dyn_sel:          int                        = 0
+
     ammo:             int                        = 4
     kills:            int                        = 0
     pitch:            float                      = 0.0
@@ -785,7 +940,6 @@ def run(args: argparse.Namespace) -> None:
     pitch_smooth:     float                      = 0.0
     roll_smooth:      float                      = 0.0
     last_frame_time:  float                      = time.time()
-    tracked_pos:      tuple[int, int] | None     = None
     pitch_offset:     float                      = 0.0
     show_mirror:      bool                       = True
     show_face_mesh:   bool                       = False
@@ -797,11 +951,11 @@ def run(args: argparse.Namespace) -> None:
     target_refresh_interval = 15
     world_frame_count       = 0
 
-    print("[HUD] Running.")
+    print("[HUD] Running.  MODE: HARRIS")
     print("  Q — quit  |  M — mirror  |  F — face mesh  |  C — calibrate pitch")
-    print("  S — save frame  |  L — lock/unlock tracker on selected target")
-    print("  Wink       — cycle targets  (or unlock tracker if active)")
-    print("  Double wink — lock tracker  (or FIRE if tracker active)")
+    print("  S — save frame  |  T — toggle Harris / Dynamic tracking mode")
+    print("  Harris mode  : single wink = cycle targets | double wink = fire")
+    print("  Dynamic mode : single wink = cycle objects | double wink = fire")
     print(f"  World cam: {args.world_cam}  |  Face cam: {args.face_cam}  |  Eye: {args.dominant_eye}")
 
     while True:
@@ -847,36 +1001,32 @@ def run(args: argparse.Namespace) -> None:
         last_frame_time = now
         flight_sim.update(calibrated_pitch, roll_smooth, dt)
 
-        # ── Optical flow update ────────────────────────────────────────────────
-        if tracker.active:
-            tracked_pos = tracker.update(world_frame)
-            if tracked_pos is None:
-                print("[HUD] Tracking lost — reverting to Harris targets.")
-
-        # ── Target detection (suspended while tracking) ───────────────────────
+        # ── Mode A: Harris corner detection ───────────────────────────────────
         world_frame_count += 1
-        if not tracker.active and world_frame_count % target_refresh_interval == 0:
-            new_targets = detect_targets(world_frame)
-            if new_targets:
-                targets      = new_targets
-                selected_idx = min(selected_idx, len(targets) - 1)
+        if mode == 'harris':
+            if world_frame_count % target_refresh_interval == 0:
+                new_targets = detect_targets(world_frame)
+                if new_targets:
+                    targets   = new_targets
+                    harris_sel = min(harris_sel, len(targets) - 1)
+
+        # ── Mode B: Dynamic object tracking ───────────────────────────────────
+        elif mode == 'dynamic':
+            dyn_objects = dyn_tracker.update(world_frame)
+            if dyn_objects:
+                dyn_sel = min(dyn_sel, len(dyn_objects) - 1)
 
         # ── Gesture events ────────────────────────────────────────────────────
         if wink_event == "single":
-            if tracker.active:
-                tracker.reset()
-                tracked_pos = None
-                print("[HUD] Tracker unlocked.")
-            elif targets:
-                selected_idx = (selected_idx + 1) % len(targets)
+            if mode == 'harris' and targets:
+                harris_sel = (harris_sel + 1) % len(targets)
+            elif mode == 'dynamic' and dyn_objects:
+                dyn_sel = (dyn_sel + 1) % len(dyn_objects)
 
-        elif wink_event == "double":
-            if not tracker.active and targets:
-                lock_pt = targets[selected_idx]
-                tracker.lock(world_frame, lock_pt)
-                tracked_pos = lock_pt
-                print(f"[HUD] Tracker locked on {lock_pt}.")
-            elif tracker.active and tracked_pos is not None and ammo > 0:
+        elif wink_event == "double" and ammo > 0:
+            can_fire = (mode == 'harris' and targets) or \
+                       (mode == 'dynamic' and dyn_objects)
+            if can_fire:
                 ammo            -= 1
                 kills           += 1
                 fire_flash_until = time.time() + 1.2
@@ -888,17 +1038,20 @@ def run(args: argparse.Namespace) -> None:
         draw_heading_tape(world_frame, flight_sim.heading_int)
         draw_boresight(world_frame)
 
-        if tracker.active and tracked_pos is not None:
-            draw_tracked_target(world_frame, tracked_pos,
-                                fired=(time.time() < fire_flash_until))
-            cv2.putText(world_frame, "TRK", (12, world_h - 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_AMBER, 1, cv2.LINE_AA)
-        else:
-            draw_targets(world_frame, targets, selected_idx,
+        if mode == 'harris':
+            draw_targets(world_frame, targets, harris_sel,
                          fired=(time.time() < fire_flash_until))
+        else:
+            draw_dynamic_targets(world_frame, dyn_objects, dyn_sel,
+                                 fired=(time.time() < fire_flash_until))
+            # Mode indicator
+            cv2.putText(world_frame, "DYN TRK",
+                        (12, world_h - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, HUD_AMBER, 1, cv2.LINE_AA)
 
-        draw_telemetry(world_frame, calibrated_pitch, yaw, roll_smooth, ammo, kills,
-                       flight_sim.speed_int, flight_sim.alt_int, flight_sim.g_force)
+        draw_telemetry(world_frame, calibrated_pitch, yaw, roll_smooth, ammo,
+                       kills, flight_sim.speed_int, flight_sim.alt_int,
+                       flight_sim.g_force)
         draw_fire_flash(world_frame, fire_flash_until)
 
         if ammo == 0:
@@ -937,16 +1090,19 @@ def run(args: argparse.Namespace) -> None:
             cv2.imwrite(fname, world_frame)
             screenshot_count += 1
             print(f"[HUD] Saved {fname}")
-        elif key == ord("l"):
-            if tracker.active:
-                tracker.reset()
-                tracked_pos = None
-                print("[HUD] Tracker unlocked.")
-            elif targets:
-                lock_pt = targets[selected_idx]
-                tracker.lock(world_frame, lock_pt)
-                tracked_pos = lock_pt
-                print(f"[HUD] Tracker locked on {lock_pt}.")
+        elif key == ord("t"):
+            if mode == 'harris':
+                mode    = 'dynamic'
+                targets = []          # clear Harris circles
+                dyn_tracker.reset()   # re-learn background from scratch
+                dyn_sel = 0
+                print("[HUD] MODE → DYNAMIC TRACKING")
+            else:
+                mode = 'harris'
+                dyn_tracker.reset()
+                dyn_objects = []
+                harris_sel  = 0
+                print("[HUD] MODE → HARRIS CORNERS")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     face_mesh.close()
@@ -971,3 +1127,308 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+#     """
+#     Tracks a single scene point across frames using Lucas-Kanade optical flow.
+#
+#     Interaction model:
+#       lock(frame, point)  — seed tracker on (x,y); samples nearby corners
+#       update(frame)       — propagate to next frame; returns centroid or None
+#       reset()             — stop tracking
+#
+#     If fewer than MIN_POINTS survive an LK iteration, tracking is abandoned.
+#     """
+#
+#     LK_PARAMS  = dict(winSize=(21, 21), maxLevel=3,
+#                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+#                                 30, 0.01))
+#     MIN_POINTS = 3
+#     PATCH_R    = 20
+#
+#     def __init__(self) -> None:
+#         self._pts:       np.ndarray | None = None
+#         self._prev_gray: np.ndarray | None = None
+#         self.active:     bool              = False
+#
+#     def lock(self, frame: np.ndarray, point: tuple[int, int]) -> None:
+#         """Initialise tracking around (x, y)."""
+#         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#         x, y = point
+#         x1 = max(0, x - self.PATCH_R);  y1 = max(0, y - self.PATCH_R)
+#         x2 = min(frame.shape[1], x + self.PATCH_R)
+#         y2 = min(frame.shape[0], y + self.PATCH_R)
+#         roi = np.float32(gray[y1:y2, x1:x2])
+#
+#         corners = None
+#         if roi.size > 0:
+#             corners = cv2.goodFeaturesToTrack(roi, maxCorners=10,
+#                                               qualityLevel=0.2, minDistance=5)
+#         if corners is None or len(corners) < self.MIN_POINTS:
+#             corners = np.array([[[float(x), float(y)]]], dtype=np.float32)
+#         else:
+#             corners[:, :, 0] += x1
+#             corners[:, :, 1] += y1
+#
+#         self._pts       = corners
+#         self._prev_gray = gray
+#         self.active     = True
+#
+#     def update(self, frame: np.ndarray) -> tuple[int, int] | None:
+#         """Propagate tracked points; return centroid or None if lost."""
+#         if not self.active or self._pts is None or self._prev_gray is None:
+#             return None
+#
+#         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#         new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+#             self._prev_gray, gray, self._pts, None, **self.LK_PARAMS
+#         )
+#
+#         if new_pts is None or status is None:
+#             self.reset(); return None
+#
+#         good = new_pts[status.flatten() == 1]
+#         if len(good) < self.MIN_POINTS:
+#             self.reset(); return None
+#
+#         self._pts       = good.reshape(-1, 1, 2)
+#         self._prev_gray = gray
+#         good_2d = good.reshape(-1, 2)
+#         return (int(np.mean(good_2d[:, 0])), int(np.mean(good_2d[:, 1])))
+#
+#     def reset(self) -> None:
+#         self._pts = None; self._prev_gray = None; self.active = False
+#
+#
+# def draw_tracked_target(frame: np.ndarray, pos: tuple[int, int],
+#                         fired: bool) -> None:
+#     """Animated tracking reticle — larger than the static Harris reticle."""
+#     x, y  = pos
+#     color = HUD_RED if not fired else (0, 0, 255)
+#     label = "TRACKING" if not fired else "SPLASH"
+#     for r in (22, 34, 46):
+#         cv2.circle(frame, (x, y), r, color, 1, cv2.LINE_AA)
+#     cv2.line(frame, (x - 55, y), (x - 25, y), color, 1, cv2.LINE_AA)
+#     cv2.line(frame, (x + 25, y), (x + 55, y), color, 1, cv2.LINE_AA)
+#     cv2.line(frame, (x, y - 55), (x, y - 25), color, 1, cv2.LINE_AA)
+#     cv2.line(frame, (x, y + 25), (x, y + 55), color, 1, cv2.LINE_AA)
+#     cv2.putText(frame, label, (x + 50, y - 10),
+#                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+#
+#
+# def run(args: argparse.Namespace) -> None:
+#     """Initialise cameras, MediaPipe, and run the main HUD loop."""
+#
+#     world_cap = open_camera(args.world_cam, "world camera")
+#     face_cap  = open_camera(args.face_cam,  "face camera")
+#
+#     mp_face_mesh = mp.solutions.face_mesh
+#     face_mesh = mp_face_mesh.FaceMesh(
+#         max_num_faces=1,
+#         refine_landmarks=True,
+#         min_detection_confidence=0.5,
+#         min_tracking_confidence=0.5,
+#     )
+#
+#     wink_detector = WinkDetector(dominant_eye=args.dominant_eye)
+#     flight_sim    = FlightSim()
+#     tracker       = OpticalFlowTracker()
+#
+#     # ── State ─────────────────────────────────────────────────────────────────
+#     targets:          list[tuple[int, int]]      = []
+#     selected_idx:     int                        = 0
+#     ammo:             int                        = 4
+#     kills:            int                        = 0
+#     pitch:            float                      = 0.0
+#     yaw:              float                      = 0.0
+#     roll:             float                      = 0.0
+#     rmat:             np.ndarray                 = np.eye(3)
+#     fire_flash_until: float                      = 0.0
+#     pitch_smooth:     float                      = 0.0
+#     roll_smooth:      float                      = 0.0
+#     last_frame_time:  float                      = time.time()
+#     tracked_pos:      tuple[int, int] | None     = None
+#     pitch_offset:     float                      = 0.0
+#     show_mirror:      bool                       = True
+#     show_face_mesh:   bool                       = False
+#
+#     save_dir         = "hud_captures"
+#     os.makedirs(save_dir, exist_ok=True)
+#     screenshot_count = 0
+#
+#     target_refresh_interval = 15
+#     world_frame_count       = 0
+#
+#     print("[HUD] Running.")
+#     print("  Q — quit  |  M — mirror  |  F — face mesh  |  C — calibrate pitch")
+#     print("  S — save frame  |  L — lock/unlock tracker on selected target")
+#     print("  Wink       — cycle targets  (or unlock tracker if active)")
+#     print("  Double wink — lock tracker  (or FIRE if tracker active)")
+#     print(f"  World cam: {args.world_cam}  |  Face cam: {args.face_cam}  |  Eye: {args.dominant_eye}")
+#
+#     while True:
+#         world_frame = read_frame(world_cap)
+#         face_frame  = read_frame(face_cap)
+#
+#         if world_frame is None or face_frame is None:
+#             print("[HUD] Warning: dropped frame — skipping.")
+#             continue
+#
+#         world_h, world_w = world_frame.shape[:2]
+#         face_h,  face_w  = face_frame.shape[:2]
+#
+#         # ── Face tracking ─────────────────────────────────────────────────────
+#         face_rgb = cv2.cvtColor(face_frame, cv2.COLOR_BGR2RGB)
+#         face_rgb.flags.writeable = False
+#         results = face_mesh.process(face_rgb)
+#         face_rgb.flags.writeable = True
+#
+#         raw_landmarks = None
+#         wink_event    = None
+#
+#         if results.multi_face_landmarks:
+#             raw_landmarks = results.multi_face_landmarks[0]
+#             landmarks     = raw_landmarks.landmark
+#
+#             pose = estimate_head_pose(landmarks, face_w, face_h)
+#             if pose is not None:
+#                 pitch, yaw, roll, rmat = pose
+#                 if abs(roll) < 90.0:
+#                     alpha        = 0.25
+#                     pitch_smooth = pitch_smooth + alpha * (pitch - pitch_smooth)
+#                     roll_smooth  = roll_smooth  + alpha * (roll  - roll_smooth)
+#                     pitch_smooth = max(-30.0, min(30.0, pitch_smooth))
+#
+#             wink_event = wink_detector.update(landmarks, face_w, face_h)
+#
+#         calibrated_pitch = pitch_smooth - pitch_offset
+#
+#         # ── Flight simulation ──────────────────────────────────────────────────
+#         now = time.time()
+#         dt  = now - last_frame_time
+#         last_frame_time = now
+#         flight_sim.update(calibrated_pitch, roll_smooth, dt)
+#
+#         # ── Optical flow update ────────────────────────────────────────────────
+#         if tracker.active:
+#             tracked_pos = tracker.update(world_frame)
+#             if tracked_pos is None:
+#                 print("[HUD] Tracking lost — reverting to Harris targets.")
+#
+#         # ── Target detection (suspended while tracking) ───────────────────────
+#         world_frame_count += 1
+#         if not tracker.active and world_frame_count % target_refresh_interval == 0:
+#             new_targets = detect_targets(world_frame)
+#             if new_targets:
+#                 targets      = new_targets
+#                 selected_idx = min(selected_idx, len(targets) - 1)
+#
+#         # ── Gesture events ────────────────────────────────────────────────────
+#         if wink_event == "single":
+#             if tracker.active:
+#                 tracker.reset()
+#                 tracked_pos = None
+#                 print("[HUD] Tracker unlocked.")
+#             elif targets:
+#                 selected_idx = (selected_idx + 1) % len(targets)
+#
+#         elif wink_event == "double":
+#             if not tracker.active and targets:
+#                 lock_pt = targets[selected_idx]
+#                 tracker.lock(world_frame, lock_pt)
+#                 tracked_pos = lock_pt
+#                 print(f"[HUD] Tracker locked on {lock_pt}.")
+#             elif tracker.active and tracked_pos is not None and ammo > 0:
+#                 ammo            -= 1
+#                 kills           += 1
+#                 fire_flash_until = time.time() + 1.2
+#                 print(f"[HUD] FIRE — kills: {kills}  ammo: {ammo}")
+#
+#         # ── HUD rendering ─────────────────────────────────────────────────────
+#         draw_horizon(world_frame, calibrated_pitch, roll_smooth)
+#         draw_bank_indicator(world_frame, roll_smooth)
+#         draw_heading_tape(world_frame, flight_sim.heading_int)
+#         draw_boresight(world_frame)
+#
+#         if tracker.active and tracked_pos is not None:
+#             draw_tracked_target(world_frame, tracked_pos,
+#                                 fired=(time.time() < fire_flash_until))
+#             cv2.putText(world_frame, "TRK", (12, world_h - 70),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_AMBER, 1, cv2.LINE_AA)
+#         else:
+#             draw_targets(world_frame, targets, selected_idx,
+#                          fired=(time.time() < fire_flash_until))
+#
+#         draw_telemetry(world_frame, calibrated_pitch, yaw, roll_smooth, ammo, kills,
+#                        flight_sim.speed_int, flight_sim.alt_int, flight_sim.g_force)
+#         draw_fire_flash(world_frame, fire_flash_until)
+#
+#         if ammo == 0:
+#             cv2.putText(world_frame, "WINCHESTER",
+#                         (world_w // 2 - 80, 60),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, HUD_RED, 2, cv2.LINE_AA)
+#
+#         cv2.imshow("HUD — World View", world_frame)
+#
+#         # ── Face mirror ────────────────────────────────────────────────────────
+#         if show_mirror:
+#             display_face = cv2.resize(face_frame, (320, 240))
+#             if show_face_mesh and raw_landmarks is not None:
+#                 draw_face_mesh(display_face, raw_landmarks,
+#                                display_face.shape[1], display_face.shape[0])
+#             cv2.imshow("Face Tracking", display_face)
+#         else:
+#             try:
+#                 cv2.destroyWindow("Face Tracking")
+#             except Exception:
+#                 pass
+#
+#         # ── Key handling ──────────────────────────────────────────────────────
+#         key = cv2.waitKey(1) & 0xFF
+#         if key == ord("q"):
+#             break
+#         elif key == ord("m"):
+#             show_mirror = not show_mirror
+#         elif key == ord("f"):
+#             show_face_mesh = not show_face_mesh
+#         elif key == ord("c"):
+#             pitch_offset = pitch_smooth
+#             print(f"[HUD] Pitch calibrated — offset set to {pitch_offset:+.1f}°")
+#         elif key == ord("s"):
+#             fname = os.path.join(save_dir, f"hud_{screenshot_count:04d}.png")
+#             cv2.imwrite(fname, world_frame)
+#             screenshot_count += 1
+#             print(f"[HUD] Saved {fname}")
+#         elif key == ord("l"):
+#             if tracker.active:
+#                 tracker.reset()
+#                 tracked_pos = None
+#                 print("[HUD] Tracker unlocked.")
+#             elif targets:
+#                 lock_pt = targets[selected_idx]
+#                 tracker.lock(world_frame, lock_pt)
+#                 tracked_pos = lock_pt
+#                 print(f"[HUD] Tracker locked on {lock_pt}.")
+#
+#     # ── Cleanup ───────────────────────────────────────────────────────────────
+#     face_mesh.close()
+#     world_cap.release()
+#     face_cap.release()
+#     cv2.destroyAllWindows()
+#     print("[HUD] Exited cleanly.")
+#
+#
+# # ──────────────────────────────────────────────
+# # Entry point
+# # ──────────────────────────────────────────────
+#
+# def main() -> None:
+#     args = parse_args()
+#     try:
+#         run(args)
+#     except RuntimeError as e:
+#         print(f"[HUD] Error: {e}", file=sys.stderr)
+#         sys.exit(1)
+#
+#
+# if __name__ == "__main__":
+#     main()
