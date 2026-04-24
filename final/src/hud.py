@@ -58,7 +58,7 @@ EAR_CLOSED_THRESHOLD   = 0.20
 # Consecutive frames below threshold to register a blink
 BLINK_CONSEC_FRAMES    = 2
 # Seconds within which two blinks constitute a double-wink → FIRE
-DOUBLE_WINK_WINDOW_SEC = 1.0
+DOUBLE_WINK_WINDOW_SEC = 2.0
 
 # Harris corner detector parameters
 HARRIS_BLOCK_SIZE  = 3
@@ -462,8 +462,9 @@ def draw_heading_tape(frame: np.ndarray, yaw: float) -> None:
 
 
 def draw_telemetry(frame: np.ndarray, pitch: float,
-                   yaw: float, roll: float) -> None:
-    """Draw speed, altitude, G-force, and angle readouts in HUD corners."""
+                   yaw: float, roll: float,
+                   ammo: int, kills: int) -> None:
+    """Draw speed, altitude, G-force, angle readouts, ammo and kill count."""
     h, w = frame.shape[:2]
     margin = 12
     line_h = 18
@@ -473,17 +474,19 @@ def draw_telemetry(frame: np.ndarray, pitch: float,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
     # ── Left column ──
-    put(f"SPD  {SIM_SPEED_KNOTS} kts",  margin, h - margin - line_h * 3)
-    put(f"ALT  {SIM_ALT_FEET:,} ft",    margin, h - margin - line_h * 2)
-    put(f"G    {SIM_G_FORCE:.1f}",       margin, h - margin - line_h)
+    put(f"SPD  {SIM_SPEED_KNOTS} kts", margin, h - margin - line_h * 3)
+    put(f"ALT  {SIM_ALT_FEET:,} ft",   margin, h - margin - line_h * 2)
+    put(f"G    {SIM_G_FORCE:.1f}",      margin, h - margin - line_h)
 
     # ── Right column ──
     put(f"PITCH  {pitch:+.1f}°", w - 155, h - margin - line_h * 3)
     put(f"YAW    {yaw:+.1f}°",   w - 155, h - margin - line_h * 2)
     put(f"ROLL   {roll:+.1f}°",  w - 155, h - margin - line_h)
 
-    # ── Top right: ammo ──
-    put(f"AMMO  04", w - 110, 28, HUD_AMBER)
+    # ── Top right: ammo and kills ──
+    ammo_color = HUD_RED if ammo == 0 else HUD_AMBER
+    put(f"AMMO  {ammo:02d}", w - 110, 28, ammo_color)
+    put(f"KILLS {kills:02d}", w - 110, 46, HUD_GREEN)
 
 
 def draw_fire_flash(frame: np.ndarray, flash_until: float) -> None:
@@ -597,39 +600,60 @@ class WinkDetector:
 # Main application loop
 # ──────────────────────────────────────────────
 
+def draw_face_mesh(frame: np.ndarray, landmarks, img_w: int, img_h: int) -> None:
+    """Draw a minimal face mesh overlay on the face camera frame."""
+    mp_drawing = mp.solutions.drawing_utils
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing.draw_landmarks(
+        image=frame,
+        landmark_list=landmarks,
+        connections=mp_face_mesh.FACEMESH_TESSELATION,
+        landmark_drawing_spec=None,
+        connection_drawing_spec=mp_drawing.DrawingSpec(
+            color=(0, 200, 0), thickness=1, circle_radius=0
+        )
+    )
+
+
 def run(args: argparse.Namespace) -> None:
     """Initialise cameras, MediaPipe, and run the main HUD loop."""
 
-    world_cap = open_camera(args.world_cam,  "world camera")
-    face_cap  = open_camera(args.face_cam,   "face camera")
+    world_cap = open_camera(args.world_cam, "world camera")
+    face_cap  = open_camera(args.face_cam,  "face camera")
 
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
         max_num_faces=1,
-        refine_landmarks=True,       # enables iris landmarks (478 total)
+        refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
 
     wink_detector = WinkDetector(dominant_eye=args.dominant_eye)
 
-    # State
-    targets:      list[tuple[int, int]] = []
-    selected_idx: int   = 0
-    ammo:         int   = 4
-    pitch:        float = 0.0
-    yaw:          float = 0.0
-    roll:         float = 0.0
+    # ── State ─────────────────────────────────────────────────────────────────
+    targets:          list[tuple[int, int]] = []
+    selected_idx:     int   = 0
+    ammo:             int   = 4
+    kills:            int   = 0
+    pitch:            float = 0.0
+    yaw:              float = 0.0
+    roll:             float = 0.0
     fire_flash_until: float = 0.0
 
-    # Refresh targets every N world frames
+    # Calibration offset — pressing C snapshots current pitch as the zero point
+    pitch_offset: float = 0.0
+
+    # UI toggles
+    show_mirror:    bool = True   # M — show/hide face camera window
+    show_face_mesh: bool = False  # F — overlay face mesh on face camera feed
+
     target_refresh_interval = 15
     world_frame_count       = 0
 
-    print("[HUD] Running — press Q to quit.")
-    print(f"[HUD] World cam index : {args.world_cam}")
-    print(f"[HUD] Face cam index  : {args.face_cam}")
-    print(f"[HUD] Dominant eye    : {args.dominant_eye}")
+    print("[HUD] Running.")
+    print("  Q — quit  |  M — toggle mirror  |  F — toggle face mesh  |  C — calibrate pitch")
+    print(f"  World cam : {args.world_cam}  |  Face cam : {args.face_cam}  |  Dominant eye : {args.dominant_eye}")
 
     while True:
         world_frame = read_frame(world_cap)
@@ -642,15 +666,18 @@ def run(args: argparse.Namespace) -> None:
         world_h, world_w = world_frame.shape[:2]
         face_h,  face_w  = face_frame.shape[:2]
 
-        # ── Face tracking (face camera) ──────────────────────────
+        # ── Face tracking ────────────────────────────────────────────────────
         face_rgb = cv2.cvtColor(face_frame, cv2.COLOR_BGR2RGB)
         face_rgb.flags.writeable = False
         results = face_mesh.process(face_rgb)
         face_rgb.flags.writeable = True
 
-        wink_event = None
+        raw_landmarks = None
+        wink_event    = None
+
         if results.multi_face_landmarks:
-            landmarks = results.multi_face_landmarks[0].landmark
+            raw_landmarks = results.multi_face_landmarks[0]
+            landmarks     = raw_landmarks.landmark
 
             pose = estimate_head_pose(landmarks, face_w, face_h)
             if pose is not None:
@@ -658,7 +685,10 @@ def run(args: argparse.Namespace) -> None:
 
             wink_event = wink_detector.update(landmarks, face_w, face_h)
 
-        # ── Target detection (world camera, periodic) ─────────────
+        # Apply calibration offset to pitch before any rendering
+        calibrated_pitch = pitch - pitch_offset
+
+        # ── Target detection (world camera, periodic) ────────────────────────
         world_frame_count += 1
         if world_frame_count % target_refresh_interval == 0:
             new_targets = detect_targets(world_frame)
@@ -666,40 +696,59 @@ def run(args: argparse.Namespace) -> None:
                 targets      = new_targets
                 selected_idx = min(selected_idx, len(targets) - 1)
 
-        # ── Gesture events ───────────────────────────────────────
+        # ── Gesture events ────────────────────────────────────────────────────
         if wink_event == "single" and targets:
             selected_idx = (selected_idx + 1) % len(targets)
 
         elif wink_event == "double" and targets and ammo > 0:
             ammo            -= 1
-            fire_flash_until = time.time() + 0.8
+            kills           += 1
+            fire_flash_until = time.time() + 1.2
 
-        # ── HUD rendering (world camera frame) ───────────────────
-        draw_horizon(world_frame, pitch, roll)
+        # ── HUD rendering ─────────────────────────────────────────────────────
+        draw_horizon(world_frame, calibrated_pitch, roll)
         draw_bank_indicator(world_frame, roll)
         draw_heading_tape(world_frame, yaw)
         draw_boresight(world_frame)
         draw_targets(world_frame, targets, selected_idx,
                      fired=(time.time() < fire_flash_until))
-        draw_telemetry(world_frame, pitch, yaw, roll)
+        draw_telemetry(world_frame, calibrated_pitch, yaw, roll, ammo, kills)
         draw_fire_flash(world_frame, fire_flash_until)
 
-        # ── Ammo depleted ─────────────────────────────────────────
         if ammo == 0:
             h, w = world_frame.shape[:2]
             cv2.putText(world_frame, "WINCHESTER", (w // 2 - 80, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, HUD_RED, 2, cv2.LINE_AA)
 
-        # ── Display ───────────────────────────────────────────────
         cv2.imshow("HUD — World View", world_frame)
 
-        # Small face-cam debug window (optional, helps during setup)
-        cv2.imshow("Face Tracking", cv2.resize(face_frame, (320, 240)))
+        # ── Face mirror window ────────────────────────────────────────────────
+        if show_mirror:
+            display_face = cv2.resize(face_frame, (320, 240))
+            if show_face_mesh and raw_landmarks is not None:
+                draw_face_mesh(display_face, raw_landmarks,
+                               display_face.shape[1], display_face.shape[0])
+            cv2.imshow("Face Tracking", display_face)
+        else:
+            # Destroy window if it was open and user toggled it off
+            try:
+                cv2.destroyWindow("Face Tracking")
+            except Exception:
+                pass
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        # ── Key handling ──────────────────────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        elif key == ord("m"):
+            show_mirror = not show_mirror
+        elif key == ord("f"):
+            show_face_mesh = not show_face_mesh
+        elif key == ord("c"):
+            pitch_offset = pitch
+            print(f"[HUD] Pitch calibrated — offset set to {pitch_offset:+.1f}°")
 
-    # ── Cleanup ───────────────────────────────────────────────────
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     face_mesh.close()
     world_cap.release()
     face_cap.release()
